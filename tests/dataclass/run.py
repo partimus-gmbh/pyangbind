@@ -22,7 +22,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(TEST_PATH))
 PLUGIN_DIR = os.path.join(BASE_DIR, "pyangbind", "plugin")
 
 
-def generate(*flags):
+def generate(*flags, output_format="pybind-dataclass"):
     pyang = shutil.which("pyang")
     if pyang is None:
         raise RuntimeError("Could not locate `pyang` executable.")
@@ -31,7 +31,7 @@ def generate(*flags):
         "--plugindir",
         PLUGIN_DIR,
         "-f",
-        "pybind-dataclass",
+        output_format,
         "-p",
         TEST_PATH,
         *flags,
@@ -74,7 +74,15 @@ class DataclassDefaultsOnTests(unittest.TestCase):
         self.assertEqual(self.box.number_with_default, 42)
         self.assertIs(self.box.flag_with_default, True)
         self.assertEqual(self.box.strings_with_defaults, ["one", "two"])
-        self.assertEqual(self.box.bits_with_default, {"alpha", "gamma"})
+        self.assertIs(self.box.bits_with_default.alpha, True)
+        self.assertIs(self.box.bits_with_default.beta, False)
+        self.assertIs(self.box.bits_with_default.gamma, True)
+
+    def test_bits_truthiness(self):
+        self.assertTrue(self.box.bits_with_default)  # alpha+gamma default True
+        self.box.bits_with_default.alpha = False
+        self.box.bits_with_default.gamma = False
+        self.assertFalse(self.box.bits_with_default)  # no bit set -> falsy
 
     def test_typedef_default_applied(self):
         self.assertEqual(self.box.from_typedef, 50)
@@ -82,15 +90,17 @@ class DataclassDefaultsOnTests(unittest.TestCase):
     def test_mutable_defaults_not_shared_between_instances(self):
         other = self.bindings.Dataclass.Box()
         self.box.strings_with_defaults.append("three")
-        self.box.bits_with_default.add("beta")
+        self.box.bits_with_default.beta = True
         self.assertEqual(other.strings_with_defaults, ["one", "two"])
-        self.assertEqual(other.bits_with_default, {"alpha", "gamma"})
+        self.assertIs(other.bits_with_default.beta, False)
 
     def test_validation_enabled_by_default(self):
         with self.assertRaises(self.bindings.YangValidationError):
             self.box.number_with_default = 5  # below range 10..4096
         with self.assertRaises(self.bindings.YangValidationError):
             self.box.with_default = 42  # not a string
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.box.bits_with_default.alpha = "yes"  # bits are bools
 
     def test_defaults_satisfy_validation_on_init(self):
         # Constructing with only defaults must not raise.
@@ -114,7 +124,10 @@ class DataclassNoDefaultsTests(unittest.TestCase):
         ):
             self.assertIsNone(getattr(box, name), name)
         self.assertEqual(box.strings_with_defaults, [])
-        self.assertIsNone(box.bits_with_default)
+        # bits: dataclass of bools, all False (and thus falsy) when unset
+        self.assertIs(box.bits_with_default.alpha, False)
+        self.assertIs(box.bits_with_default.gamma, False)
+        self.assertFalse(box.bits_with_default)
 
     def test_validation_still_enabled(self):
         box = self.bindings.Dataclass.Box()
@@ -138,6 +151,28 @@ class DataclassNoValidationTests(unittest.TestCase):
 
     def test_defaults_still_applied(self):
         self.assertEqual(self.bindings.Dataclass.Box().with_default, "lol")
+
+
+class DataclassDumbTests(unittest.TestCase):
+    """The feature-free pybind-dataclass-dumb variant shares the
+    structural bits-as-dataclass-of-bools shape, without behavior."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate(output_format="pybind-dataclass-dumb")
+
+    def test_bits_dataclass_of_bools(self):
+        box = self.bindings.Dataclass.Box()
+        self.assertIs(box.bits_with_default.alpha, False)  # no YANG defaults applied
+        self.assertFalse(box.bits_with_default)
+        box.bits_with_default.beta = True
+        self.assertTrue(box.bits_with_default)
+
+    def test_no_features(self):
+        self.assertFalse(hasattr(self.bindings, "YangValidationError"))
+        box = self.bindings.Dataclass.Box()
+        self.assertIsNone(box.with_default)
+        box.number_with_default = 5  # no validation
 
 
 class DataclassAllOffTests(unittest.TestCase):

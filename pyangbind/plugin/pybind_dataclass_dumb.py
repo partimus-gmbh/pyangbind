@@ -1,10 +1,11 @@
 """pybind-dataclass-dumb: the deliberately dumb variant of pybind-dataclass.
 
-Frozen snapshot of pybind-dataclass before validation and default-value
-support were added: pure structure and type hints, nothing else. Kept as
-its own output format for consumers that want the guarantee that the
-generated code can never raise on assignment and that an unset leaf is
-always None.
+The feature-free variant of pybind-dataclass: pure structure and type
+hints, no validation, no YANG defaults. Kept as its own output format for
+consumers that want the guarantee that the generated code can never raise
+on assignment and that an unset leaf is always None/False. It tracks
+pybind-dataclass's *structural* improvements (e.g. bits leaves as nested
+dataclasses of bools) but never its behavioral features.
 
 An alternative output format to the classic ``pybind`` plugin. Instead of
 pyangbind's dynamic class machinery (``YANGDynClass`` wrappers, properties
@@ -23,6 +24,9 @@ definitions with real type annotations:
                     the base, in both bare (``bgp``) and module-prefixed
                     (``frr-bgp:bgp``) spelling
 - union          -> ``T1 | T2`` of the mapped member types
+- bits           -> nested dataclass with one ``bool = False`` field per
+                    YANG bit, truthy iff any bit is set (inside a union:
+                    ``set[str]``, a union member cannot be a nested class)
 - choice/case    -> flattened into the parent (mutual exclusion of cases is
                     not enforced)
 
@@ -226,6 +230,26 @@ class _Emitter:
             self.lines.append(("%s%s" % (indent, line)).rstrip())
         self.lines.append('%s"""' % indent)
 
+    def _emit_bits_class(self, node, resolved_type, cname, indent):
+        """A bits leaf becomes a nested dataclass with one bool per YANG
+        bit -- typo-proof and autocompleted, unlike a set[str]. The
+        instance is truthy iff any bit is set, preserving the
+        'falsy means not explicitly configured' contract. Bits inside a
+        *union* stay set[str] (a union member cannot be a nested class)."""
+        self.lines.append("%s@dataclasses.dataclass" % indent)
+        self.lines.append("%sclass %s:" % (indent, cname))
+        body_indent = indent + "    "
+        self.lines.append(
+            '%s"""Bits `%s`: one bool per YANG bit; truthy iff any bit is set."""'
+            % (body_indent, node.arg)
+        )
+        for bit in resolved_type.search("bit"):
+            self.lines.append("%s%s: bool = False" % (body_indent, safe_name(bit.arg)))
+        self.lines.append("")
+        self.lines.append("%sdef __bool__(self) -> bool:" % body_indent)
+        self.lines.append("%s    return any(vars(self).values())" % body_indent)
+        self.lines.append("")
+
     def emit_node_class(self, stmt, cname, indent):
         """Emit a dataclass for a container / list entry / module."""
         self.lines.append("%s@dataclasses.dataclass" % indent)
@@ -254,15 +278,34 @@ class _Emitter:
                         % (body_indent, fname, child_cname)
                     )
                 self.lines.append("")
-            elif child.keyword == "leaf":
+            elif child.keyword in ("leaf", "leaf-list"):
+                resolved = self._resolve_typedef_chain(child.search_one("type"))
+                if resolved.arg == "bits" and resolved.search("bit"):
+                    child_cname = class_name(child.arg)
+                    while child_cname in used_class_names:
+                        child_cname += "_"
+                    used_class_names.add(child_cname)
+                    self._emit_bits_class(child, resolved, child_cname, body_indent)
+                    if child.keyword == "leaf-list":
+                        self.lines.append(
+                            "%s%s: list[%s] = dataclasses.field(default_factory=list)"
+                            % (body_indent, fname, child_cname)
+                        )
+                    else:
+                        self.lines.append(
+                            "%s%s: %s = dataclasses.field(default_factory=%s)"
+                            % (body_indent, fname, child_cname, child_cname)
+                        )
+                    self.lines.append("")
+                    continue
                 ann = self.annotation(child.search_one("type"), child)
-                self.lines.append("%s%s: %s | None = None" % (body_indent, fname, ann))
-            elif child.keyword == "leaf-list":
-                ann = self.annotation(child.search_one("type"), child)
-                self.lines.append(
-                    "%s%s: list[%s] = dataclasses.field(default_factory=list)"
-                    % (body_indent, fname, ann)
-                )
+                if child.keyword == "leaf":
+                    self.lines.append("%s%s: %s | None = None" % (body_indent, fname, ann))
+                else:
+                    self.lines.append(
+                        "%s%s: list[%s] = dataclasses.field(default_factory=list)"
+                        % (body_indent, fname, ann)
+                    )
 
         if len(self.lines) == body_start:
             self.lines.append("%spass" % body_indent)

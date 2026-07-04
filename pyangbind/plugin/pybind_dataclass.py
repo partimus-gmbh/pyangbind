@@ -17,6 +17,9 @@ definitions with real type annotations:
                     the base, in both bare (``bgp``) and module-prefixed
                     (``frr-bgp:bgp``) spelling
 - union          -> ``T1 | T2`` of the mapped member types
+- bits           -> nested dataclass with one ``bool = False`` field per
+                    YANG bit, truthy iff any bit is set (inside a union:
+                    ``set[str]``, a union member cannot be a nested class)
 - choice/case    -> flattened into the parent (mutual exclusion of cases is
                     not enforced)
 
@@ -77,6 +80,8 @@ _SCALAR_TYPE_MAP = {
     # (or any truthy assignment) marks it present, `None` absent.
     "empty": "bool",
     "binary": "bytes",
+    # only reachable for bits inside a union; a bits *leaf* becomes a
+    # nested dataclass of bools instead (see _emit_bits_class)
     "bits": "set[str]",
     "instance-identifier": "str",
 }
@@ -540,10 +545,8 @@ class _Emitter:
         if default_stmt is None:
             return None, None
 
-        base = chain[-1]
-        if base.arg == "bits":
-            names = sorted(default_stmt.arg.split())
-            return None, "lambda: {%s}" % ", ".join(repr(n) for n in names)
+        # (bits leaves never get here -- they take the nested-dataclass
+        # path in emit_node_class, where the default sets bit fields True)
         return self._default_value_expr(default_stmt.arg, type_stmt), None
 
     def _default_value_expr(self, text, type_stmt):
@@ -593,6 +596,55 @@ class _Emitter:
         for line in lines[1:]:
             self.lines.append(("%s%s" % (indent, line)).rstrip())
         self.lines.append('%s"""' % indent)
+
+    def _emit_bits_class(self, node, resolved_type, cname, indent):
+        """A bits leaf becomes a nested dataclass with one bool per YANG
+        bit -- typo-proof and autocompleted, unlike a set[str]. The
+        instance is truthy iff any bit is set, preserving the
+        'falsy means not explicitly configured' contract. A YANG default
+        (e.g. 'alpha gamma') becomes True defaults on those bit fields.
+        Bits inside a *union* stay set[str] (a union member cannot be a
+        nested class)."""
+        self.lines.append("%s@dataclasses.dataclass" % indent)
+        base = "(_YangNode)" if self.with_validation else ""
+        self.lines.append("%sclass %s%s:" % (indent, cname, base))
+        body_indent = indent + "    "
+        self.lines.append(
+            '%s"""Bits `%s`: one bool per YANG bit; truthy iff any bit is set."""'
+            % (body_indent, node.arg)
+        )
+
+        default_bits = set()
+        if self.with_defaults and node.keyword == "leaf":
+            default_stmt = node.search_one("default")
+            for level in self._typedef_chain(node.search_one("type")):
+                if default_stmt is not None:
+                    break
+                typedef = getattr(level, "i_typedef", None)
+                if typedef is not None:
+                    default_stmt = typedef.search_one("default")
+            if default_stmt is not None:
+                default_bits = set(default_stmt.arg.split())
+
+        bit_fields = []
+        for bit in resolved_type.search("bit"):
+            bit_fname = safe_name(bit.arg)
+            bit_fields.append(bit_fname)
+            self.lines.append(
+                "%s%s: bool = %s" % (body_indent, bit_fname, bit.arg in default_bits)
+            )
+
+        if self.with_validation:
+            self.lines.append("")
+            self.lines.append("%s_field_checks = {" % body_indent)
+            for bit_fname in bit_fields:
+                self.lines.append("%s    %r: _Check('bool')," % (body_indent, bit_fname))
+            self.lines.append("%s}" % body_indent)
+
+        self.lines.append("")
+        self.lines.append("%sdef __bool__(self) -> bool:" % body_indent)
+        self.lines.append("%s    return any(vars(self).values())" % body_indent)
+        self.lines.append("")
 
     def _emit_leaf(self, child, fname, indent):
         ann = self.annotation(child.search_one("type"), child)
@@ -646,6 +698,25 @@ class _Emitter:
                     )
                 self.lines.append("")
             else:  # leaf / leaf-list
+                resolved = self._resolve_typedef_chain(child.search_one("type"))
+                if resolved.arg == "bits" and resolved.search("bit"):
+                    child_cname = class_name(child.arg)
+                    while child_cname in used_class_names:
+                        child_cname += "_"
+                    used_class_names.add(child_cname)
+                    self._emit_bits_class(child, resolved, child_cname, body_indent)
+                    if child.keyword == "leaf-list":
+                        self.lines.append(
+                            "%s%s: list[%s] = dataclasses.field(default_factory=list)"
+                            % (body_indent, fname, child_cname)
+                        )
+                    else:
+                        self.lines.append(
+                            "%s%s: %s = dataclasses.field(default_factory=%s)"
+                            % (body_indent, fname, child_cname, child_cname)
+                        )
+                    self.lines.append("")
+                    continue
                 self._emit_leaf(child, fname, body_indent)
                 if self.with_validation:
                     check = self.check_expr(child.search_one("type"), child)
