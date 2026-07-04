@@ -1,0 +1,156 @@
+#!/usr/bin/env python
+"""Tests for the pybind-dataclass output plugin.
+
+Standalone (does not use tests.base.PyangBindTestCase, which hardcodes
+`-f pybind`): generates bindings from dataclass.yang in every flag
+combination and exercises them. The generation itself is half the test:
+executing the generated module would raise dataclasses' "non-default
+argument follows default argument" TypeError if any field were ever
+emitted without a default -- dataclass.yang deliberately interleaves
+YANG-defaulted and default-less leaves to pin that down.
+"""
+
+import os.path
+import shutil
+import subprocess
+import sys
+import types
+import unittest
+
+TEST_PATH = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(TEST_PATH))
+PLUGIN_DIR = os.path.join(BASE_DIR, "pyangbind", "plugin")
+
+
+def generate(*flags):
+    pyang = shutil.which("pyang")
+    if pyang is None:
+        raise RuntimeError("Could not locate `pyang` executable.")
+    cmd = [
+        pyang,
+        "--plugindir",
+        PLUGIN_DIR,
+        "-f",
+        "pybind-dataclass",
+        "-p",
+        TEST_PATH,
+        *flags,
+        os.path.join(TEST_PATH, "dataclass.yang"),
+    ]
+    code = subprocess.check_output(cmd, stderr=subprocess.PIPE, env={"PYTHONPATH": BASE_DIR})
+    module = types.ModuleType("dataclass_bindings")
+    # Registered in sys.modules because dataclasses' ClassVar/KW_ONLY
+    # string-annotation handling looks the defining module up there
+    # (3.12+); a bare exec into an unregistered module crashes it.
+    sys.modules[module.__name__] = module
+    try:
+        # Raises TypeError here if any generated field lacks a default.
+        exec(compile(code, "dataclass_bindings.py", "exec"), module.__dict__)
+    finally:
+        del sys.modules[module.__name__]
+    return module
+
+
+class DataclassDefaultsOnTests(unittest.TestCase):
+    """Default flags: validation and YANG defaults both generated."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate()
+
+    def setUp(self):
+        self.box = self.bindings.Dataclass.Box()
+
+    def test_default_less_leaf_after_defaulted_leaf_generates(self):
+        # dataclass.yang has plain-after directly after with-default; the
+        # module executed, so no field-ordering TypeError occurred. Both
+        # spellings of "unset" behave:
+        self.assertIsNone(self.box.plain_before)
+        self.assertIsNone(self.box.plain_after)
+        self.assertIsNone(self.box.plain_trailing)
+
+    def test_yang_defaults_applied(self):
+        self.assertEqual(self.box.with_default, "lol")
+        self.assertEqual(self.box.number_with_default, 42)
+        self.assertIs(self.box.flag_with_default, True)
+        self.assertEqual(self.box.strings_with_defaults, ["one", "two"])
+        self.assertEqual(self.box.bits_with_default, {"alpha", "gamma"})
+
+    def test_typedef_default_applied(self):
+        self.assertEqual(self.box.from_typedef, 50)
+
+    def test_mutable_defaults_not_shared_between_instances(self):
+        other = self.bindings.Dataclass.Box()
+        self.box.strings_with_defaults.append("three")
+        self.box.bits_with_default.add("beta")
+        self.assertEqual(other.strings_with_defaults, ["one", "two"])
+        self.assertEqual(other.bits_with_default, {"alpha", "gamma"})
+
+    def test_validation_enabled_by_default(self):
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.box.number_with_default = 5  # below range 10..4096
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.box.with_default = 42  # not a string
+
+    def test_defaults_satisfy_validation_on_init(self):
+        # Constructing with only defaults must not raise.
+        self.bindings.Dataclass()
+
+
+class DataclassNoDefaultsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate("--no-dataclass-defaults")
+
+    def test_all_leaves_none_when_unset(self):
+        box = self.bindings.Dataclass.Box()
+        for name in (
+            "plain_before",
+            "with_default",
+            "plain_after",
+            "number_with_default",
+            "flag_with_default",
+            "from_typedef",
+        ):
+            self.assertIsNone(getattr(box, name), name)
+        self.assertEqual(box.strings_with_defaults, [])
+        self.assertIsNone(box.bits_with_default)
+
+    def test_validation_still_enabled(self):
+        box = self.bindings.Dataclass.Box()
+        with self.assertRaises(self.bindings.YangValidationError):
+            box.number_with_default = 5
+
+
+class DataclassNoValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate("--no-dataclass-validation")
+
+    def test_no_validation_runtime(self):
+        self.assertFalse(hasattr(self.bindings, "YangValidationError"))
+        self.assertFalse(hasattr(self.bindings, "_YangNode"))
+
+    def test_assignment_never_raises(self):
+        box = self.bindings.Dataclass.Box()
+        box.number_with_default = 5  # out of range, but validation is off
+        self.assertEqual(box.number_with_default, 5)
+
+    def test_defaults_still_applied(self):
+        self.assertEqual(self.bindings.Dataclass.Box().with_default, "lol")
+
+
+class DataclassAllOffTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate("--no-dataclass-validation", "--no-dataclass-defaults")
+
+    def test_bare_bindings(self):
+        box = self.bindings.Dataclass.Box()
+        self.assertIsNone(box.with_default)
+        box.number_with_default = 5  # no validation
+        self.assertFalse(hasattr(self.bindings, "YangValidationError"))
+
+
+if __name__ == "__main__":
+    unittest.main()

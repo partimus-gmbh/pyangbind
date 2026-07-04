@@ -1,0 +1,68 @@
+module dataclass {
+  yang-version 1.1;
+  namespace "http://pyangbind.example.com/dataclass";
+  prefix "dc";
+
+  description
+    "Fixture for the pybind-dataclass output plugin. Deliberately places
+     leaves WITH a YANG default before leaves WITHOUT one: since every
+     generated field must carry some Python default (None, the YANG
+     default, or a factory), this ordering must never provoke
+     dataclasses' 'non-default argument follows default argument'
+     TypeError -- neither within one class nor via inheritance from the
+     generated base.";
+
+  typedef percent {
+    type uint8 {
+      range "0..100";
+    }
+    default 50;
+  }
+
+  container box {
+    leaf plain-before {
+      type string;
+    }
+    leaf with-default {
+      type string;
+      default "lol";
+    }
+    leaf plain-after {
+      type string;
+    }
+    leaf number-with-default {
+      type uint16 {
+        range "10..4096";
+      }
+      default 42;
+    }
+    leaf flag-with-default {
+      type boolean;
+      default true;
+    }
+    leaf from-typedef {
+      type percent;
+    }
+    leaf-list strings-with-defaults {
+      type string;
+      default "one";
+      default "two";
+    }
+    leaf bits-with-default {
+      type bits {
+        bit alpha;
+        bit beta;
+        bit gamma;
+      }
+      default "alpha gamma";
+    }
+    container nested-after-defaults {
+      leaf inner-plain {
+        type string;
+      }
+    }
+    leaf plain-trailing {
+      type string;
+    }
+  }
+}
