@@ -101,6 +101,17 @@ Serialisation (opt-in with ``--dataclass-serde``)
     are encoded by their Python value type (a 64-bit integer union member
     is emitted as a JSON number).
 
+XPaths (opt-in with ``--dataclass-xpaths``)
+    Every generated class gets its absolute schema path as a
+    ``_yang_schema_path`` ClassVar (module-name-qualified at the top and
+    at module boundaries, matching FRR northbound convention), and the
+    module gets ``data_path(root, node)`` computing the *instance* path
+    of a container / list-entry / bits node with ``[key=value]``
+    predicates -- root-relative, since the dataclasses deliberately carry
+    no parent pointers. (PEP 750 t-strings were evaluated and rejected:
+    their interpolations evaluate eagerly at literal-creation time, so a
+    class-level template cannot defer to instance state.)
+
 Origin comments (opt-in with ``--dataclass-origin-comments``)
     Augment-heavy schemas (FRR's, for one) make it genuinely hard to see
     where a generated node comes from. With this flag, every class/field
@@ -200,6 +211,27 @@ class _FieldMeta:
     unique: tuple = ()  # list `unique` groups, tuples of field names
     leafref: str | None = None  # absolute schema path of the leafref target
     case: tuple | None = None  # (choice, case) of choice-flattened fields
+
+
+def _qualified_name(meta, parent_module):
+    return (
+        meta.yang_name
+        if meta.module == parent_module
+        else "%s:%s" % (meta.module, meta.yang_name)
+    )
+
+
+def _instance_key(entry, meta):
+    """`key=value` text of a list entry's key leaves, for instance paths."""
+    if not meta.keys:
+        return None
+    entry_fields = getattr(type(entry), "_yang_fields", {})
+    parts = []
+    for key in meta.keys:
+        key_meta = entry_fields.get(key)
+        yang_key = key_meta.yang_name if key_meta is not None else key
+        parts.append("%s=%r" % (yang_key, getattr(entry, key, None)))
+    return ",".join(parts)
 '''
 
 # Runtime embedded at the top of the generated module unless
@@ -340,19 +372,6 @@ class _YangNode:
             object.__setattr__(self, name, value)
 
 
-def _instance_key(entry, meta):
-    """`key=value` text of a list entry's key leaves, for instance paths."""
-    if not meta.keys:
-        return None
-    entry_fields = getattr(type(entry), "_yang_fields", {})
-    parts = []
-    for key in meta.keys:
-        key_meta = entry_fields.get(key)
-        yang_key = key_meta.yang_name if key_meta is not None else key
-        parts.append("%s=%r" % (yang_key, getattr(entry, key, None)))
-    return ",".join(parts)
-
-
 def validate_tree(*roots):
     """Whole-tree validation of one or more binding roots.
 
@@ -394,11 +413,7 @@ def validate_tree(*roots):
         exists = False
         for fname, meta in fields.items():
             value = getattr(node, fname, None)
-            qualified = (
-                meta.yang_name
-                if meta.module == parent_module
-                else "%s:%s" % (meta.module, meta.yang_name)
-            )
+            qualified = _qualified_name(meta, parent_module)
             fpath = "%s/%s" % (path, qualified)
             fschema = "%s/%s" % (schema_path, qualified)
             field_set = False
@@ -534,14 +549,6 @@ def validate_tree(*roots):
 # YangValidationError, when generated, is a subclass) so callers can catch
 # uniformly whether or not validation is generated.
 _SERDE_RUNTIME = '''
-def _qualified_name(meta, parent_module):
-    return (
-        meta.yang_name
-        if meta.module == parent_module
-        else "%s:%s" % (meta.module, meta.yang_name)
-    )
-
-
 def _encode_value(meta, value):
     if meta.cls is not None and isinstance(value, meta.cls):
         # a bits dataclass -> RFC 7951 space-separated set-bit names
@@ -667,6 +674,46 @@ def _decode_into(node, data):
 '''
 
 
+# XPath runtime, embedded with --dataclass-xpaths. The schema paths live
+# in per-class _yang_schema_path ClassVars; this adds instance paths.
+_XPATH_RUNTIME = '''
+def data_path(root, node):
+    """Instance path of `node` (a container / list-entry / bits dataclass
+    of the tree under `root`), with [key=value] predicates on list steps;
+    None when `node` is not in the tree. Dataclasses carry no parent
+    pointers, so the path is computed by a root-relative search."""
+    if node is root:
+        return "/"
+
+    def search(current, path, parent_module):
+        for fname, meta in getattr(type(current), "_yang_fields", {}).items():
+            value = getattr(current, fname, None)
+            if value is None:
+                continue
+            step = "%s/%s" % (path, _qualified_name(meta, parent_module))
+            if meta.kind == "container":
+                if value is node:
+                    return step
+                found = search(value, step, meta.module)
+                if found is not None:
+                    return found
+            elif meta.kind == "list":
+                for index, entry in enumerate(value):
+                    key_text = _instance_key(entry, meta)
+                    epath = "%s[%s]" % (step, index if key_text is None else key_text)
+                    if entry is node:
+                        return epath
+                    found = search(entry, epath, meta.module)
+                    if found is not None:
+                        return found
+            elif meta.cls is not None and value is node:  # a bits instance
+                return step
+        return None
+
+    return search(root, "", None)
+'''
+
+
 def pyang_plugin_init():
     plugin.register_plugin(PybindDataclassPlugin())
 
@@ -696,6 +743,16 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             help="Generate to_ietf_json()/from_ietf_json() functions "
             "(RFC 7951 JSON encoding of YANG data, as plain dicts) into "
             "the module",
+        )
+        group.add_option(
+            "--dataclass-xpaths",
+            dest="dataclass_xpaths",
+            action="store_true",
+            default=False,
+            help="Emit each class's absolute schema path as a "
+            "_yang_schema_path ClassVar and generate a data_path(root, "
+            "node) function computing instance paths with list-key "
+            "predicates",
         )
         group.add_option(
             "--dataclass-origin-comments",
@@ -729,6 +786,7 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             with_defaults=not getattr(ctx.opts, "no_dataclass_defaults", False),
             with_origin_comments=getattr(ctx.opts, "dataclass_origin_comments", False),
             with_serde=getattr(ctx.opts, "dataclass_serde", False),
+            with_xpaths=getattr(ctx.opts, "dataclass_xpaths", False),
         )
 
 
@@ -821,7 +879,8 @@ def _parse_range_arg(arg):
 class _Emitter:
     def __init__(
         self, ctx, identity_values, with_validation, with_defaults,
-        with_origin_comments=False, with_serde=False, identity_canonical=None,
+        with_origin_comments=False, with_serde=False, with_xpaths=False,
+        identity_canonical=None,
     ):
         self.ctx = ctx
         self.identity_values = identity_values
@@ -830,8 +889,9 @@ class _Emitter:
         self.with_defaults = with_defaults
         self.with_origin_comments = with_origin_comments
         self.with_serde = with_serde
+        self.with_xpaths = with_xpaths
         # The schema metadata table is emitted whenever some feature needs it.
-        self.with_meta = with_validation or with_serde
+        self.with_meta = with_validation or with_serde or with_xpaths
         # Names of the modules classes are emitted for; leafrefs whose
         # target lies outside these trees cannot be checked and get no
         # `leafref` metadata. Filled in by build_dataclasses.
@@ -1484,6 +1544,12 @@ class _Emitter:
             self.lines.append("")
             self.lines.append("%s_yang_name = %r" % (body_indent, stmt.arg))
             self.lines.append("%s_yang_module = %r" % (body_indent, self._module_name(stmt)))
+            if self.with_xpaths:
+                if stmt.keyword in ("module", "submodule"):
+                    schema_path = "/"
+                else:
+                    schema_path, _ = self._abs_data_path(stmt)
+                self.lines.append("%s_yang_schema_path = %r" % (body_indent, schema_path))
             if choices:
                 self.lines.append("%s_yang_choices = %r" % (body_indent, choices))
             if field_metas:
@@ -1499,14 +1565,14 @@ class _Emitter:
 
 def build_dataclasses(
     ctx, modules, fd, with_validation=True, with_defaults=True,
-    with_origin_comments=False, with_serde=False,
+    with_origin_comments=False, with_serde=False, with_xpaths=False,
 ):
     identity_values, identity_canonical = _build_identity_values(ctx)
 
     emitter = _Emitter(
         ctx, identity_values, with_validation, with_defaults,
         with_origin_comments=with_origin_comments, with_serde=with_serde,
-        identity_canonical=identity_canonical,
+        with_xpaths=with_xpaths, identity_canonical=identity_canonical,
     )
     # Reserve the top-level module class names so a reusable type (emitted in
     # the same module namespace) can never shadow one of them.
@@ -1544,6 +1610,8 @@ def build_dataclasses(
         header.append(_VALIDATION_RUNTIME.rstrip())
     if with_serde:
         header.append(_SERDE_RUNTIME.rstrip())
+    if with_xpaths:
+        header.append(_XPATH_RUNTIME.rstrip())
     header.extend(["", ""])
 
     # Reusable types (Literal aliases, bits dataclasses) go between the

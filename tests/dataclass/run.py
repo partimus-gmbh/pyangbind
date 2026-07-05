@@ -541,6 +541,45 @@ class DataclassSerdeTests(unittest.TestCase):
         self.assertFalse(hasattr(generate(), "to_ietf_json"))
 
 
+class DataclassXpathTests(unittest.TestCase):
+    """--dataclass-xpaths: _yang_schema_path ClassVars + data_path()."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate("--dataclass-xpaths")
+
+    def test_schema_paths(self):
+        self.assertEqual(self.bindings.Dataclass._yang_schema_path, "/")
+        self.assertEqual(self.bindings.Dataclass.Box._yang_schema_path, "/dataclass:box")
+        self.assertEqual(
+            self.bindings.Dataclass.Refs.Server._yang_schema_path,
+            "/dataclass:refs/server",
+        )
+
+    def test_data_path_with_key_predicates(self):
+        tree = self.bindings.Dataclass()
+        Server = self.bindings.Dataclass.Refs.Server
+        tree.refs.server = [Server(name="a"), Server(name="b")]
+        self.assertEqual(self.bindings.data_path(tree, tree), "/")
+        self.assertEqual(self.bindings.data_path(tree, tree.refs), "/dataclass:refs")
+        self.assertEqual(
+            self.bindings.data_path(tree, tree.refs.server[1]),
+            "/dataclass:refs/server[name='b']",
+        )
+        self.assertIsNone(self.bindings.data_path(tree, Server(name="elsewhere")))
+
+    def test_works_without_validation(self):
+        bindings = generate("--dataclass-xpaths", "--no-dataclass-validation")
+        self.assertFalse(hasattr(bindings, "YangValidationError"))
+        tree = bindings.Dataclass()
+        self.assertEqual(bindings.data_path(tree, tree.box), "/dataclass:box")
+
+    def test_off_by_default(self):
+        plain = generate()
+        self.assertFalse(hasattr(plain, "data_path"))
+        self.assertFalse(hasattr(plain.Dataclass, "_yang_schema_path"))
+
+
 class DataclassNoDefaultsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
