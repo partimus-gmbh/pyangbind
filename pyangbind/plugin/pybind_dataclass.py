@@ -62,6 +62,19 @@ Defaults (disable with ``--no-dataclass-defaults``)
     (``None``, the YANG default, or a factory), so the dataclass
     "non-default field follows defaulted field" TypeError cannot occur.
 
+Whenever any feature needs it (currently: validation), every generated
+class additionally carries schema metadata in ClassVars -- invisible to
+``__init__``/``repr``/``==`` and to type-checker field lists:
+
+- ``_yang_fields`` -- dict of field name -> ``_FieldMeta`` (original YANG
+  name, defining module, node kind, nested class reference, value check,
+  IETF-JSON encoding tag, structural flags such as mandatory / list keys /
+  unique / min- and max-elements, resolved leafref target path,
+  choice/case membership)
+- ``_yang_name`` / ``_yang_module`` -- the class's own YANG identity
+- ``_yang_choices`` -- choice name -> mandatory flag, for the choices
+  flattened into the class
+
 The pre-validation/pre-defaults variant of this backend is preserved
 verbatim as ``pybind-dataclass-dumb``.
 """
@@ -128,6 +141,31 @@ _INT_BUILTIN_RANGE = {
 }
 
 _DATA_KEYWORDS = ("container", "list", "leaf", "leaf-list", "choice")
+
+# Runtime embedded whenever any generated feature needs per-field schema
+# metadata (validation today; serialisation and xpaths reuse the same
+# table). Stdlib-only, like everything embedded in the generated module.
+_META_RUNTIME = '''
+@dataclasses.dataclass(frozen=True)
+class _FieldMeta:
+    """Schema metadata for one generated field (a leaf / leaf-list /
+    container / list, or one bool bit of a bits dataclass)."""
+
+    yang_name: str
+    module: str  # module that contributed the node (RFC 7951 qualifier)
+    kind: str  # "leaf" | "leaf-list" | "container" | "list" | "bit"
+    cls: type | None = None  # nested/bits class of container/list/bits fields
+    check: typing.Any = None  # _Check, when validation is generated
+    encode: str | None = None  # IETF-JSON value encoding tag, when special
+    mandatory: bool = False
+    presence: bool = False  # presence container
+    min_elements: int | None = None
+    max_elements: int | None = None
+    keys: tuple = ()  # list key field names
+    unique: tuple = ()  # list `unique` groups, tuples of field names
+    leafref: str | None = None  # absolute schema path of the leafref target
+    case: tuple | None = None  # (choice, case) of choice-flattened fields
+'''
 
 # Runtime embedded at the top of the generated module unless
 # --no-dataclass-validation is given. Stdlib-only, so the generated file
@@ -232,19 +270,19 @@ class _YangNode:
     """Base of every generated dataclass: validates each assignment
     (dataclass __init__ assigns through __setattr__ too)."""
 
-    _field_checks: typing.ClassVar[dict] = {}
+    _yang_fields: typing.ClassVar[dict] = {}
 
     if not typing.TYPE_CHECKING:
 
         def __setattr__(self, name, value):
-            check = self._field_checks.get(name)
-            if check is not None and value is not None:
+            meta = self._yang_fields.get(name)
+            if meta is not None and meta.check is not None and value is not None:
                 path = "%s.%s" % (type(self).__name__, name)
                 if isinstance(value, list):
                     for index, element in enumerate(value):
-                        check.validate(element, "%s[%d]" % (path, index))
+                        meta.check.validate(element, "%s[%d]" % (path, index))
                 else:
-                    check.validate(value, path)
+                    meta.check.validate(value, path)
             object.__setattr__(self, name, value)
 '''
 
@@ -375,6 +413,13 @@ class _Emitter:
         self.identity_values = identity_values
         self.with_validation = with_validation
         self.with_defaults = with_defaults
+        # The schema metadata table is emitted whenever some feature needs
+        # it (today only validation; serialisation/xpaths will extend this).
+        self.with_meta = with_validation
+        # Names of the modules classes are emitted for; leafrefs whose
+        # target lies outside these trees cannot be checked and get no
+        # `leafref` metadata. Filled in by build_dataclasses.
+        self.emitted_module_names = set()
         self.lines = []
         self.uses_decimal = False
         # Module-level reusable types (Literal aliases and bits dataclasses),
@@ -498,6 +543,131 @@ class _Emitter:
         if ptr is None or ptr[0].search_one("type") is None:
             return None
         return ptr[0]
+
+    # ---- schema metadata --------------------------------------------------
+
+    @staticmethod
+    def _module_name(stmt):
+        """RFC 7951 name qualifier of a statement: the name of the (main)
+        module that contributed it; submodules resolve to their
+        belongs-to."""
+        if stmt.keyword in ("module", "submodule"):
+            module = stmt
+        else:
+            module = getattr(stmt, "i_module", None)
+            if module is None:
+                return stmt.arg
+        if module.keyword == "submodule":
+            belongs_to = module.search_one("belongs-to")
+            if belongs_to is not None:
+                return belongs_to.arg
+        return module.arg
+
+    def _abs_data_path(self, stmt):
+        """Absolute data-node path of a schema node, module-name-qualified
+        at the top and wherever the module changes (RFC 7951 / FRR
+        northbound convention). Returns (path, root_module_name)."""
+        steps = []
+        node = stmt
+        while node is not None and node.keyword not in ("module", "submodule"):
+            if node.keyword not in ("choice", "case"):  # not data nodes
+                steps.append(node)
+            node = node.parent
+        steps.reverse()
+        parts, parent_module = [], None
+        for step in steps:
+            module = self._module_name(step)
+            parts.append("%s:%s" % (module, step.arg) if module != parent_module else step.arg)
+            parent_module = module
+        root_module = self._module_name(steps[0]) if steps else None
+        return "/" + "/".join(parts), root_module
+
+    def _leafref_path(self, node):
+        """Absolute schema path of a leaf's resolved leafref target, or
+        None when it cannot / must not be checked (unresolved,
+        require-instance false, or target outside the emitted modules)."""
+        ptr = getattr(node, "i_leafref_ptr", None)
+        if ptr is None:
+            return None
+        for level in self._typedef_chain(node.search_one("type")):
+            require = level.search_one("require-instance")
+            if require is not None and require.arg == "false":
+                return None
+        path, root_module = self._abs_data_path(ptr[0])
+        if root_module not in self.emitted_module_names:
+            return None
+        return path
+
+    def _encode_tag(self, type_stmt, node, depth=0):
+        """IETF-JSON value encoding tag for types that do not encode as
+        their natural Python/JSON value, or None."""
+        if depth > 16:
+            return None
+        t = self._resolve_typedef_chain(type_stmt)
+        if t.arg == "leafref":
+            target = self._leafref_target(node, depth)
+            if target is not None:
+                return self._encode_tag(target.search_one("type"), target, depth + 1)
+            return None
+        if t.arg in ("int64", "uint64"):
+            return "int64"  # RFC 7951: 64-bit ints are JSON strings
+        if t.arg == "decimal64":
+            return "decimal"
+        if t.arg == "empty":
+            return "empty"
+        if t.arg == "binary":
+            return "binary"
+        if t.arg == "identityref":
+            return "identityref"
+        if t.arg == "bits" and t.search("bit"):
+            return "bits"
+        return None
+
+    def field_meta_expr(self, child, case, cls_name=None):
+        """`_FieldMeta(...)` constructor source for one field."""
+        kind = child.keyword
+        args = [repr(child.arg), repr(self._module_name(child)), repr(kind)]
+        if cls_name is not None:
+            args.append("cls=%s" % cls_name)
+        if kind in ("leaf", "leaf-list"):
+            if self.with_validation:
+                check = self.check_expr(child.search_one("type"), child)
+                if check is not None:
+                    args.append("check=%s" % check)
+            encode = self._encode_tag(child.search_one("type"), child)
+            if encode is not None:
+                args.append("encode=%r" % encode)
+            leafref = self._leafref_path(child)
+            if leafref is not None:
+                args.append("leafref=%r" % leafref)
+        if kind == "leaf":
+            mandatory = child.search_one("mandatory")
+            if mandatory is not None and mandatory.arg == "true":
+                args.append("mandatory=True")
+        if kind == "container" and child.search_one("presence") is not None:
+            args.append("presence=True")
+        if kind in ("list", "leaf-list"):
+            min_elements = child.search_one("min-elements")
+            if min_elements is not None:
+                args.append("min_elements=%d" % int(min_elements.arg))
+            max_elements = child.search_one("max-elements")
+            if max_elements is not None and max_elements.arg != "unbounded":
+                args.append("max_elements=%d" % int(max_elements.arg))
+        if kind == "list":
+            key = child.search_one("key")
+            if key is not None:
+                args.append("keys=%r" % (tuple(safe_name(k) for k in key.arg.split()),))
+            unique_groups = []
+            for unique in child.search("unique"):
+                parts = unique.arg.split()
+                if any("/" in part for part in parts):
+                    continue  # descendant unique paths are not checked
+                unique_groups.append(tuple(safe_name(p.split(":")[-1]) for p in parts))
+            if unique_groups:
+                args.append("unique=%r" % (tuple(unique_groups),))
+        if case is not None:
+            args.append("case=%r" % (case,))
+        return "_FieldMeta(%s)" % ", ".join(args)
 
     @staticmethod
     def _literal(values):
@@ -640,20 +810,37 @@ class _Emitter:
     # ---- tree walking ---------------------------------------------------
 
     @staticmethod
-    def _data_children(stmt):
-        """Config-true data children, with choice/case flattened away."""
-        out = []
+    def _flattened_children(stmt):
+        """Config-true data children with choice/case flattened away.
+        Returns (entries, choices): entries as (child, case) pairs where
+        `case` is the (outermost) (choice, case) pair a child was
+        flattened out of, or None; choices as choice name -> mandatory."""
+        entries, choices = [], {}
         for child in getattr(stmt, "i_children", []) or []:
             if child.keyword not in _DATA_KEYWORDS:
                 continue
             if not getattr(child, "i_config", True):
                 continue
             if child.keyword == "choice":
+                mandatory = child.search_one("mandatory")
+                choices[child.arg] = mandatory is not None and mandatory.arg == "true"
                 for case in getattr(child, "i_children", []) or []:
-                    out.extend(_Emitter._data_children(case))
+                    if case.keyword == "case":
+                        sub_entries, sub_choices = _Emitter._flattened_children(case)
+                        entries.extend(
+                            (sub, (child.arg, case.arg)) for sub, _ in sub_entries
+                        )
+                        choices.update(sub_choices)
+                    elif case.keyword in _DATA_KEYWORDS:  # shorthand case
+                        entries.append((case, (child.arg, case.arg)))
             else:
-                out.append(child)
-        return out
+                entries.append((child, None))
+        return entries, choices
+
+    @staticmethod
+    def _data_children(stmt):
+        """Config-true data children, with choice/case flattened away."""
+        return [child for child, _ in _Emitter._flattened_children(stmt)[0]]
 
     def _docstring(self, stmt, indent):
         desc_stmt = stmt.search_one("description")
@@ -680,7 +867,8 @@ class _Emitter:
         typedef = getattr(type_stmt, "i_typedef", None)
         label = typedef.arg if typedef is not None else node.arg
         preferred = class_name(typedef.arg if typedef is not None else node.arg)
-        bit_fnames = [safe_name(bit.arg) for bit in resolved_type.search("bit")]
+        bits = [(safe_name(bit.arg), bit.arg) for bit in resolved_type.search("bit")]
+        bits_module = self._module_name(resolved_type)
 
         def build(name):
             base = "(_YangNode)" if self.with_validation else ""
@@ -690,11 +878,18 @@ class _Emitter:
                 '    """Bits `%s`: one bool per YANG bit; truthy iff any bit is set."""'
                 % label,
             ]
-            out.extend("    %s: bool = False" % bit_fname for bit_fname in bit_fnames)
-            if self.with_validation:
+            out.extend("    %s: bool = False" % bit_fname for bit_fname, _ in bits)
+            if self.with_meta:
                 out.append("")
-                out.append("    _field_checks = {")
-                out.extend("        %r: _Check('bool')," % bf for bf in bit_fnames)
+                out.append("    _yang_name = %r" % label)
+                out.append("    _yang_module = %r" % bits_module)
+                out.append("    _yang_fields = {")
+                check = ", check=_Check('bool')" if self.with_validation else ""
+                out.extend(
+                    "        %r: _FieldMeta(%r, %r, 'bit'%s),"
+                    % (bit_fname, bit_yang, bits_module, check)
+                    for bit_fname, bit_yang in bits
+                )
                 out.append("    }")
             out.append("")
             out.append("    def __bool__(self) -> bool:")
@@ -755,8 +950,9 @@ class _Emitter:
         self._docstring(stmt, body_indent)
 
         used_class_names = set()
-        field_checks = []
-        for child in self._data_children(stmt):
+        field_metas = []
+        entries, choices = self._flattened_children(stmt)
+        for child, case in entries:
             fname = safe_name(child.arg)
             if child.keyword in ("container", "list"):
                 child_cname = class_name(child.arg)
@@ -775,37 +971,43 @@ class _Emitter:
                         % (body_indent, fname, child_cname)
                     )
                 self.lines.append("")
+                field_metas.append((fname, self.field_meta_expr(child, case, child_cname)))
             else:  # leaf / leaf-list
                 resolved = self._resolve_typedef_chain(child.search_one("type"))
                 if resolved.arg == "bits" and resolved.search("bit"):
-                    cname = self._register_bits_class(
+                    bits_cname = self._register_bits_class(
                         child.search_one("type"), resolved, child
                     )
                     if child.keyword == "leaf-list":
                         self.lines.append(
                             "%s%s: list[%s] = dataclasses.field(default_factory=list)"
-                            % (body_indent, fname, cname)
+                            % (body_indent, fname, bits_cname)
                         )
                     else:
-                        factory = self._bits_default_factory(child, cname)
+                        factory = self._bits_default_factory(child, bits_cname)
                         self.lines.append(
                             "%s%s: %s = dataclasses.field(default_factory=%s)"
-                            % (body_indent, fname, cname, factory)
+                            % (body_indent, fname, bits_cname, factory)
                         )
                     self.lines.append("")
+                    field_metas.append(
+                        (fname, self.field_meta_expr(child, case, bits_cname))
+                    )
                     continue
                 self._emit_leaf(child, fname, body_indent)
-                if self.with_validation:
-                    check = self.check_expr(child.search_one("type"), child)
-                    if check is not None:
-                        field_checks.append((fname, check))
+                field_metas.append((fname, self.field_meta_expr(child, case)))
 
-        if field_checks:
+        if self.with_meta:
             self.lines.append("")
-            self.lines.append("%s_field_checks = {" % body_indent)
-            for fname, check in field_checks:
-                self.lines.append("%s    %r: %s," % (body_indent, fname, check))
-            self.lines.append("%s}" % body_indent)
+            self.lines.append("%s_yang_name = %r" % (body_indent, stmt.arg))
+            self.lines.append("%s_yang_module = %r" % (body_indent, self._module_name(stmt)))
+            if choices:
+                self.lines.append("%s_yang_choices = %r" % (body_indent, choices))
+            if field_metas:
+                self.lines.append("%s_yang_fields = {" % body_indent)
+                for fname, meta in field_metas:
+                    self.lines.append("%s    %r: %s," % (body_indent, fname, meta))
+                self.lines.append("%s}" % body_indent)
 
         if len(self.lines) == body_start:
             self.lines.append("%spass" % body_indent)
@@ -819,13 +1021,11 @@ def build_dataclasses(ctx, modules, fd, with_validation=True, with_defaults=True
     # Reserve the top-level module class names so a reusable type (emitted in
     # the same module namespace) can never shadow one of them.
     emitter.reusable_names.update(class_name(m.arg) for m in modules)
-    emitted_any = False
-    for module in modules:
-        if not _Emitter._data_children(module):
-            continue
-        emitted_any = True
+    data_modules = [m for m in modules if _Emitter._data_children(m)]
+    emitter.emitted_module_names = {m.arg for m in data_modules}
+    for module in data_modules:
         emitter.emit_node_class(module, class_name(module.arg), "")
-    if not emitted_any:
+    if not data_modules:
         emitter.lines.append("# (none of the input modules define config data nodes)")
 
     header = [
@@ -845,6 +1045,8 @@ def build_dataclasses(ctx, modules, fd, with_validation=True, with_defaults=True
         header.append("import re")
     if emitter.uses_decimal or with_validation:
         header.append("import decimal")
+    if emitter.with_meta:
+        header.append(_META_RUNTIME.rstrip())
     if with_validation:
         header.append(_VALIDATION_RUNTIME)
     header.extend(["", ""])

@@ -100,4 +100,53 @@ module dataclass {
       type string;
     }
   }
+
+  // Structural-constraint material: list keys/unique/max-elements,
+  // mandatory, leafref, choice/case, min-elements. Consumed by the
+  // metadata table and the validate_tree() whole-tree pass.
+  container refs {
+    list server {
+      key "name";
+      unique "port";
+      max-elements 4;
+      leaf name {
+        type string;
+      }
+      leaf port {
+        type uint16;
+      }
+      leaf proto {
+        type string;
+        mandatory true;
+      }
+    }
+    leaf active-server {
+      type leafref {
+        path "../server/name";
+      }
+    }
+    leaf unchecked-server {
+      type leafref {
+        path "../server/name";
+        require-instance false;
+      }
+    }
+    leaf-list tags {
+      type string;
+      min-elements 1;
+    }
+    choice transport {
+      mandatory true;
+      case tcp {
+        leaf tcp-port {
+          type uint16;
+        }
+      }
+      case udp {
+        leaf udp-port {
+          type uint16;
+        }
+      }
+    }
+  }
 }

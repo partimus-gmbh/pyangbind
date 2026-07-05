@@ -204,6 +204,77 @@ class DataclassBitsUnionTests(unittest.TestCase):
             entry.bits.flag1 = "yes"  # bits fields are bools
 
 
+class DataclassMetadataTests(unittest.TestCase):
+    """Every generated class carries a `_yang_fields` schema metadata table
+    (plus `_yang_name`/`_yang_module`/`_yang_choices` ClassVars) whenever a
+    feature needs it -- currently whenever validation is generated."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate()
+        cls.top = cls.bindings.Dataclass
+
+    def test_class_identity(self):
+        self.assertEqual(self.top._yang_name, "dataclass")
+        self.assertEqual(self.top._yang_module, "dataclass")
+        self.assertEqual(self.top.Box._yang_name, "box")
+
+    def test_leaf_meta_maps_back_to_yang_name(self):
+        meta = self.top.Box._yang_fields["plain_before"]
+        self.assertEqual(meta.yang_name, "plain-before")
+        self.assertEqual(meta.module, "dataclass")
+        self.assertEqual(meta.kind, "leaf")
+        self.assertIsNotNone(meta.check)
+
+    def test_container_and_list_meta_reference_nested_class(self):
+        self.assertIs(self.top._yang_fields["box"].cls, self.top.Box)
+        self.assertEqual(self.top._yang_fields["box"].kind, "container")
+        server = self.top.Refs._yang_fields["server"]
+        self.assertEqual(server.kind, "list")
+        self.assertIs(server.cls, self.top.Refs.Server)
+
+    def test_list_structural_meta(self):
+        server = self.top.Refs._yang_fields["server"]
+        self.assertEqual(server.keys, ("name",))
+        self.assertEqual(server.unique, (("port",),))
+        self.assertEqual(server.max_elements, 4)
+        self.assertTrue(self.top.Refs.Server._yang_fields["proto"].mandatory)
+
+    def test_leaf_list_min_elements(self):
+        self.assertEqual(self.top.Refs._yang_fields["tags"].min_elements, 1)
+
+    def test_leafref_target_path(self):
+        meta = self.top.Refs._yang_fields["active_server"]
+        self.assertEqual(meta.leafref, "/dataclass:refs/server/name")
+
+    def test_require_instance_false_opts_out(self):
+        self.assertIsNone(self.top.Refs._yang_fields["unchecked_server"].leafref)
+
+    def test_choice_membership_and_mandatory(self):
+        self.assertEqual(
+            self.top.Refs._yang_fields["tcp_port"].case, ("transport", "tcp")
+        )
+        self.assertEqual(
+            self.top.Refs._yang_fields["udp_port"].case, ("transport", "udp")
+        )
+        self.assertEqual(self.top.Refs._yang_choices, {"transport": True})
+
+    def test_bits_meta(self):
+        meta = self.top.Box._yang_fields["bits_with_default"]
+        self.assertEqual(meta.encode, "bits")
+        self.assertIs(meta.cls, self.bindings.BitsWithDefault)
+        bit = self.bindings.BitsWithDefault._yang_fields["alpha"]
+        self.assertEqual((bit.kind, bit.yang_name), ("bit", "alpha"))
+
+    def test_metadata_invisible_to_dataclass_machinery(self):
+        import dataclasses as dc
+
+        field_names = {f.name for f in dc.fields(self.top.Refs)}
+        self.assertNotIn("_yang_fields", field_names)
+        # repr/eq untouched by ClassVar metadata
+        self.assertEqual(self.top.Refs.Server(), self.top.Refs.Server())
+
+
 class DataclassNoDefaultsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -240,6 +311,9 @@ class DataclassNoValidationTests(unittest.TestCase):
     def test_no_validation_runtime(self):
         self.assertFalse(hasattr(self.bindings, "YangValidationError"))
         self.assertFalse(hasattr(self.bindings, "_YangNode"))
+        # No feature needs the metadata table -> it is not emitted either.
+        self.assertFalse(hasattr(self.bindings, "_FieldMeta"))
+        self.assertFalse(hasattr(self.bindings.Dataclass.Box, "_yang_fields"))
 
     def test_assignment_never_raises(self):
         box = self.bindings.Dataclass.Box()
