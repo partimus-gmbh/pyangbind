@@ -86,6 +86,9 @@ class DataclassDefaultsOnTests(unittest.TestCase):
         self.assertIs(self.box.bits_with_default.alpha, True)
         self.assertIs(self.box.bits_with_default.beta, False)
         self.assertIs(self.box.bits_with_default.gamma, True)
+        # identityref default is normalised to the bare spelling even
+        # though the YANG default statement spells it "dc:cat"
+        self.assertEqual(self.box.pet_with_default, "cat")
 
     def test_bits_truthiness(self):
         self.assertTrue(self.box.bits_with_default)  # alpha+gamma default True
@@ -510,6 +513,17 @@ class DataclassSerdeTests(unittest.TestCase):
             self.bindings.Dataclass, encoded
         )
         self.assertEqual(decoded, self.tree)
+
+    def test_decode_normalises_identityref_spelling(self):
+        # every accepted spelling decodes to the bare one -- including a
+        # spelling that is itself a valid map key (the prefixed form),
+        # which used to be returned untouched and broke round-trip
+        # equality whenever a module's prefix equals its name
+        for spelling in ("dog", "dc:dog", "dataclass:dog"):
+            decoded = self.bindings.from_ietf_json(
+                self.bindings.Dataclass, {"box": {"pet": spelling}}
+            )
+            self.assertEqual(decoded.box.pet, "dog", spelling)
 
     def test_decode_accepts_bare_names(self):
         decoded = self.bindings.from_ietf_json(

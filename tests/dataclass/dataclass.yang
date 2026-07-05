@@ -84,6 +84,13 @@ module dataclass {
         base animal;
       }
     }
+    // identityref default spelled with a prefix -> normalised to bare.
+    leaf pet-with-default {
+      type identityref {
+        base animal;
+      }
+      default "dc:cat";
+    }
     // Inline anonymous enum -> stays inlined, NOT hoisted to a module alias.
     leaf mood {
       type enumeration {

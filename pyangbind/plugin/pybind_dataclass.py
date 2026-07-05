@@ -623,11 +623,13 @@ def _decode_value(meta, value):
     if meta.encode == "binary" and isinstance(value, str):
         return base64.b64decode(value)
     if meta.encode == "identityref" and isinstance(value, str) and meta.identity_map:
-        if value in meta.identity_map:
-            return value  # already an accepted spelling
-        accepted = [k for k, v in meta.identity_map.items() if v == value]
+        # Normalise every accepted spelling (bare, prefixed, or RFC 7951
+        # module-qualified) to the preferred one -- bare unless the bare
+        # name is claimed by a different identity -- so a decoded tree
+        # compares equal to one built with defaults/bare assignments.
+        canonical = meta.identity_map.get(value, value)
+        accepted = [k for k, v in meta.identity_map.items() if v == canonical]
         if accepted:
-            # prefer the bare spelling over the prefixed one
             return min(accepted, key=lambda s: (":" in s, s))
     return value
 
@@ -1344,7 +1346,24 @@ class _Emitter:
                 return repr(int(text, 0))
             except ValueError:
                 return repr(text)
+        if base.arg == "identityref":
+            return repr(self._normalized_identity_spelling(text, base))
         return repr(text)
+
+    def _normalized_identity_spelling(self, text, resolved_type_stmt):
+        """Preferred spelling of an identityref default: bare unless the
+        bare name is claimed by a different identity. A YANG default may
+        spell the identity with the *importing* module's prefix, which the
+        spelling map (keyed on the defining module's prefix + bare) does
+        not contain -- fall back to the bare name to find it."""
+        base = resolved_type_stmt.search_one("base")
+        identity = getattr(base, "i_identity", None) if base is not None else None
+        mapping = self.identity_canonical.get(id(identity), {})
+        canonical = mapping.get(text) or mapping.get(text.split(":")[-1])
+        if canonical is None:
+            return text
+        accepted = [s for s, c in mapping.items() if c == canonical]
+        return min(accepted, key=lambda s: (":" in s, s))
 
     # ---- tree walking ---------------------------------------------------
 
