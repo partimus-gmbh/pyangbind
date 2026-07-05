@@ -677,5 +677,99 @@ class DataclassAllOffTests(unittest.TestCase):
         self.assertFalse(hasattr(self.bindings, "YangValidationError"))
 
 
+class DataclassSplitDirTests(unittest.TestCase):
+    """--dataclass-split-dir: package output, shared code emitted once."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib
+        import tempfile
+
+        cls.tmp = tempfile.mkdtemp()
+        cls.pkg_dir = os.path.join(cls.tmp, "dc_split")
+        pyang = shutil.which("pyang")
+        if pyang is None:
+            raise RuntimeError("Could not locate `pyang` executable.")
+        subprocess.check_output(
+            [
+                pyang,
+                "--plugindir",
+                PLUGIN_DIR,
+                "-f",
+                "pybind-dataclass",
+                "-p",
+                TEST_PATH,
+                "--dataclass-serde",
+                "--dataclass-xpaths",
+                "--dataclass-split-dir",
+                cls.pkg_dir,
+                os.path.join(TEST_PATH, "dataclass.yang"),
+            ],
+            stderr=subprocess.PIPE,
+            env={"PYTHONPATH": BASE_DIR},
+        )
+        sys.path.insert(0, cls.tmp)
+        cls.bindings = importlib.import_module("dc_split")
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.remove(cls.tmp)
+        for name in [n for n in sys.modules if n.split(".")[0] == "dc_split"]:
+            del sys.modules[name]
+        shutil.rmtree(cls.tmp)
+
+    def _sources(self):
+        for filename in sorted(os.listdir(self.pkg_dir)):
+            if filename.endswith(".py"):
+                with open(os.path.join(self.pkg_dir, filename)) as fd:
+                    yield filename, fd.read()
+
+    def test_package_layout(self):
+        self.assertEqual(
+            sorted(f for f, _ in self._sources()),
+            ["__init__.py", "_runtime.py", "_types.py", "dataclass.py"],
+        )
+
+    def test_shared_code_emitted_once(self):
+        for marker in (
+            "class YangValidationError",
+            "class _FieldMeta",
+            "def validate_tree",
+            "def to_ietf_json",
+            "def data_path",
+            "type Animal =",
+        ):
+            hits = [f for f, src in self._sources() if marker in src]
+            self.assertEqual(len(hits), 1, "%r found in %s" % (marker, hits))
+
+    def test_same_import_surface_as_single_file(self):
+        # runtime API, reusable aliases and the tree class all resolve on
+        # the package itself, like they do on a single-file module
+        for name in (
+            "Dataclass",
+            "Animal",
+            "YangValidationError",
+            "validate_tree",
+            "to_ietf_json",
+            "from_ietf_json",
+            "data_path",
+        ):
+            self.assertTrue(hasattr(self.bindings, name), name)
+
+    def test_bindings_work_end_to_end(self):
+        tree = self.bindings.Dataclass()
+        tree.box.pet = "dc:dog"
+        with self.assertRaises(self.bindings.YangValidationError):
+            tree.box.mood = "angry"
+        self.bindings.validate_tree(tree)
+        encoded = self.bindings.to_ietf_json(tree)
+        self.assertEqual(encoded["dataclass:box"]["pet"], "dataclass:dog")
+        decoded = self.bindings.from_ietf_json(self.bindings.Dataclass, encoded)
+        self.assertEqual(decoded.box.pet, "dog")  # normalised spelling
+        self.assertEqual(
+            self.bindings.data_path(tree, tree.box), "/dataclass:box"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
