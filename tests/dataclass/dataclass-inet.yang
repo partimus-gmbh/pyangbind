@@ -1,0 +1,64 @@
+module dataclass-inet {
+  yang-version 1.1;
+  namespace "urn:tests:dataclass-inet";
+  prefix din;
+
+  import ietf-inet-types {
+    prefix inet;
+  }
+
+  description
+    "Fixture for the native-ip-types mapping: every ietf-inet-types
+     address/prefix typedef shape (direct use, derived typedef with a
+     default, union member, leaf-list), plus a non-address inet typedef
+     that must stay untouched.";
+
+  typedef gateway-address {
+    type inet:ipv4-address-no-zone;
+    default "192.0.2.1";
+  }
+
+  container net {
+    leaf v4 {
+      type inet:ipv4-address-no-zone;
+    }
+    leaf v4-zoned {
+      type inet:ipv4-address;
+    }
+    leaf v6 {
+      type inet:ipv6-address;
+    }
+    leaf v6-no-zone {
+      type inet:ipv6-address-no-zone;
+    }
+    leaf any-address {
+      type inet:ip-address;
+    }
+    leaf-list servers {
+      type inet:ip-address-no-zone;
+    }
+    leaf prefix4 {
+      type inet:ipv4-prefix;
+    }
+    leaf prefix6 {
+      type inet:ipv6-prefix;
+    }
+    leaf any-prefix {
+      type inet:ip-prefix;
+    }
+    leaf gateway {
+      type gateway-address;
+    }
+    leaf addr-or-name {
+      type union {
+        type inet:ipv4-address-no-zone;
+        type string {
+          pattern "[a-z]+";
+        }
+      }
+    }
+    leaf port {
+      type inet:port-number;
+    }
+  }
+}

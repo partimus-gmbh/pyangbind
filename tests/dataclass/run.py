@@ -695,6 +695,232 @@ class DataclassXsdPatternTests(unittest.TestCase):
         self.assertIsNone(_python_pattern(r"\p{Zs}"))  # unmapped category
 
 
+class DataclassNativeInetTests(unittest.TestCase):
+    """Native IP types (on by default): ietf-inet-types address/prefix
+    typedefs map onto the stdlib ipaddress classes
+    (dataclass-inet.yang)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.yang = os.path.join(TEST_PATH, "dataclass-inet.yang")
+        cls.bindings = generate("--dataclass-serde", yang_file=cls.yang)
+
+    def setUp(self):
+        import ipaddress
+
+        self.ip = ipaddress
+        self.net = self.bindings.DataclassInet().net
+
+    def test_annotations(self):
+        anns = self.bindings.DataclassInet.Net.__annotations__
+        self.assertEqual(anns["v4"], "ipaddress.IPv4Address | None")
+        self.assertEqual(anns["v6"], "ipaddress.IPv6Address | None")
+        self.assertEqual(
+            anns["any_address"],
+            "ipaddress.IPv4Address | ipaddress.IPv6Address | None",
+        )
+        self.assertEqual(
+            anns["servers"], "list[ipaddress.IPv4Address | ipaddress.IPv6Address]"
+        )
+        self.assertEqual(anns["prefix4"], "ipaddress.IPv4Network | None")
+        self.assertEqual(
+            anns["any_prefix"],
+            "ipaddress.IPv4Network | ipaddress.IPv6Network | None",
+        )
+        # derived typedef resolves through to the inet base
+        self.assertIn("IPv4Address", anns["gateway"])
+        # union member: native alongside the other members
+        self.assertEqual(anns["addr_or_name"], "ipaddress.IPv4Address | str | None")
+        # non-address inet typedefs stay untouched
+        self.assertEqual(anns["port"], "int | None")
+
+    def test_class_checked_instead_of_pattern(self):
+        self.net.v4 = self.ip.IPv4Address("10.0.0.1")
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.net.v4 = "10.0.0.1"  # the string spelling is no longer a value
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.net.prefix4 = self.ip.IPv6Network("2001:db8::/32")  # wrong family
+        self.net.any_address = self.ip.IPv6Address("2001:db8::1")  # either family
+
+    def test_ipv6_zone_rides_scope_id_and_no_zone_rejects_it(self):
+        self.net.v6 = self.ip.IPv6Address("fe80::1%eth0")
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.net.v6_no_zone = self.ip.IPv6Address("fe80::1%eth0")
+        self.net.v6_no_zone = self.ip.IPv6Address("fe80::1")
+
+    def test_typedef_default_constructs_the_object(self):
+        self.assertEqual(self.net.gateway, self.ip.IPv4Address("192.0.2.1"))
+
+    def test_union_keeps_other_members(self):
+        self.net.addr_or_name = self.ip.IPv4Address("192.0.2.9")
+        self.net.addr_or_name = "gateway"
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.net.addr_or_name = "NOPE"  # fails the string member's pattern
+
+    def test_serde_round_trip(self):
+        tree = self.bindings.DataclassInet()
+        net = tree.net
+        net.v6 = self.ip.IPv6Address("fe80::1%eth0")
+        net.servers = [
+            self.ip.IPv4Address("192.0.2.7"),
+            self.ip.IPv6Address("2001:db8::7"),
+        ]
+        net.prefix4 = self.ip.IPv4Network("10.0.0.0/24")
+        net.any_prefix = self.ip.IPv6Network("2001:db8::/64")
+        net.addr_or_name = self.ip.IPv4Address("192.0.2.9")
+        encoded = self.bindings.to_ietf_json(tree)
+        net_json = encoded["dataclass-inet:net"]
+        self.assertEqual(net_json["v6"], "fe80::1%eth0")  # zone survives str()
+        self.assertEqual(net_json["prefix4"], "10.0.0.0/24")
+        self.assertEqual(net_json["addr-or-name"], "192.0.2.9")  # union member
+        decoded = self.bindings.from_ietf_json(self.bindings.DataclassInet, encoded)
+        self.assertEqual(decoded, tree)
+        # the mixed union's *string* member round-trips as a string
+        net.addr_or_name = "gateway"
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassInet, self.bindings.to_ietf_json(tree)
+        )
+        self.assertEqual(decoded.net.addr_or_name, "gateway")
+
+    def test_serde_without_validation_still_decodes_natives(self):
+        bindings = generate(
+            "--dataclass-serde", "--no-dataclass-validation", yang_file=self.yang
+        )
+        tree = bindings.DataclassInet()
+        tree.net.v4 = self.ip.IPv4Address("10.0.0.1")
+        tree.net.addr_or_name = self.ip.IPv4Address("192.0.2.9")
+        decoded = bindings.from_ietf_json(
+            bindings.DataclassInet, bindings.to_ietf_json(tree)
+        )
+        self.assertEqual(decoded, tree)
+
+    def test_opt_out_flag(self):
+        bindings = generate("--no-dataclass-native-ip-types", yang_file=self.yang)
+        anns = bindings.DataclassInet.Net.__annotations__
+        self.assertEqual(anns["v4"], "str | None")
+        self.assertEqual(anns["any_prefix"], "str | None")
+        net = bindings.DataclassInet().net
+        net.v4 = "10.0.0.1"  # pattern-checked string, as before
+        with self.assertRaises(bindings.YangValidationError):
+            net.v4 = "999.0.0.1"
+        net.v4_zoned = "10.0.0.1%3"  # IPv4 zone index expressible as a string
+        self.assertEqual(net.gateway, "192.0.2.1")
+
+
+class DataclassNativeHintTests(unittest.TestCase):
+    """The --dataclass-native-type option (dataclass-native-hint.yang):
+    generator-supplied native Python classes for schema-defined string
+    typedefs -- a generator-only concern, never YANG metadata. E.g.
+    ipaddress.IPv4Interface for ADDR/PREFIXLEN values, the one
+    interface-address shape RFC 6991 has no typedef for."""
+
+    HINT_FLAGS = (
+        # module-qualified spelling
+        "--dataclass-native-type",
+        "dataclass-native-hint:ipv4-address-and-prefix=ipaddress.IPv4Interface",
+        # unqualified (any-module) spelling, multi-class union
+        "--dataclass-native-type",
+        "ip-address-and-prefix=ipaddress.IPv4Interface,ipaddress.IPv6Interface",
+        # a non-ipaddress package, pinning the generic import emission
+        "--dataclass-native-type",
+        "posix-path=pathlib.PurePosixPath",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.yang = os.path.join(TEST_PATH, "dataclass-native-hint.yang")
+        cls.bindings = generate(
+            "--dataclass-serde", *cls.HINT_FLAGS, yang_file=cls.yang
+        )
+
+    def setUp(self):
+        import ipaddress
+
+        self.ip = ipaddress
+        self.host = self.bindings.DataclassNativeHint().host
+
+    def test_annotations(self):
+        anns = self.bindings.DataclassNativeHint.Host.__annotations__
+        self.assertEqual(anns["addr4"], "ipaddress.IPv4Interface | None")
+        self.assertEqual(
+            anns["addr"], "ipaddress.IPv4Interface | ipaddress.IPv6Interface | None"
+        )
+        self.assertEqual(anns["workdir"], "pathlib.PurePosixPath | None")
+        # union: the hinted member joins the inet-native and str members
+        self.assertEqual(
+            anns["addr_or_bare_or_name"],
+            "ipaddress.IPv4Interface | ipaddress.IPv6Interface | "
+            "ipaddress.IPv4Address | ipaddress.IPv6Address | str | None",
+        )
+
+    def test_isinstance_replaces_the_string_pattern(self):
+        self.host.addr4 = self.ip.IPv4Interface("10.0.12.3/24")  # host bits kept
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.host.addr4 = "10.0.12.3/24"  # the string spelling
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.host.addr4 = self.ip.IPv6Interface("2001:db8::1/64")  # v4-only hint
+
+    def test_default_constructs_the_class(self):
+        self.assertEqual(
+            self.host.addr_with_default, self.ip.IPv4Interface("192.0.2.1/24")
+        )
+
+    def test_non_ipaddress_package_hint_and_import(self):
+        import pathlib
+
+        self.host.workdir = pathlib.PurePosixPath("/etc/network")
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.host.workdir = "/etc/network"
+
+    def test_unmapped_typedefs_stay_strings(self):
+        bindings = generate(yang_file=self.yang)  # no --dataclass-native-type
+        anns = bindings.DataclassNativeHint.Host.__annotations__
+        self.assertEqual(anns["addr4"], "str | None")
+        self.assertEqual(anns["workdir"], "str | None")
+
+    def test_union_members_keep_their_types_through_serde(self):
+        tree = self.bindings.DataclassNativeHint()
+        for value in (
+            self.ip.IPv4Address("10.0.0.1"),  # bare: never gains a /32
+            self.ip.IPv4Interface("10.0.12.3/24"),  # host bits survive
+            self.ip.IPv6Interface("2001:db8::1/64"),
+            "gateway",  # the plain-string member
+        ):
+            tree.host.addr_or_bare_or_name = value
+            decoded = self.bindings.from_ietf_json(
+                self.bindings.DataclassNativeHint, self.bindings.to_ietf_json(tree)
+            )
+            self.assertEqual(decoded, tree)
+            self.assertIs(type(decoded.host.addr_or_bare_or_name), type(value))
+
+    def test_leaf_list_round_trip(self):
+        tree = self.bindings.DataclassNativeHint()
+        tree.host.addrs = [
+            self.ip.IPv4Interface("10.0.0.1/8"),
+            self.ip.IPv6Interface("2001:db8::7/64"),
+        ]
+        self.bindings.validate_tree(tree)
+        encoded = self.bindings.to_ietf_json(tree)
+        self.assertEqual(
+            encoded["dataclass-native-hint:host"]["addrs"],
+            ["10.0.0.1/8", "2001:db8::7/64"],
+        )
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassNativeHint, encoded
+        )
+        self.assertEqual(decoded, tree)
+
+    def test_hint_wins_over_no_native_ip_types_flag(self):
+        # the flag disables the built-in ietf mapping only; an explicit
+        # --dataclass-native-type mapping stays honored
+        bindings = generate(
+            "--no-dataclass-native-ip-types", *self.HINT_FLAGS, yang_file=self.yang
+        )
+        anns = bindings.DataclassNativeHint.Host.__annotations__
+        self.assertEqual(anns["addr4"], "ipaddress.IPv4Interface | None")
+        self.assertIn("str", anns["addr_or_bare_or_name"])  # inet member reverts
+
+
 class DataclassMustWhenTests(unittest.TestCase):
     """validate_tree() evaluates YANG must/when constraints with the
     embedded XPath 1.0 subset engine (dataclass-constraints.yang)."""

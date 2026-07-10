@@ -1,0 +1,67 @@
+module dataclass-native-hint {
+  yang-version 1.1;
+  namespace "urn:tests:dataclass-native-hint";
+  prefix dnh;
+
+  import ietf-inet-types {
+    prefix inet;
+  }
+
+  description
+    "Fixture for the --dataclass-native-type option: ordinary
+     pattern-restricted string typedefs the *generator invocation*
+     (never the YANG itself) maps onto native Python classes --
+     single- and multi-class mappings, a YANG default on a mapped
+     typedef, and a union mixing a mapped member with an
+     ietf-inet-types member and a plain string.";
+
+  typedef ipv4-address-and-prefix {
+    type string {
+      pattern '[0-9.]+/(([0-9])|([1-2][0-9])|(3[0-2]))';
+    }
+    description
+      "ADDR/PREFIXLEN with meaningful host bits -- what inet:ipv4-prefix
+       is not.";
+  }
+
+  typedef ip-address-and-prefix {
+    type string {
+      pattern '[0-9a-fA-F:./]+/[0-9]+';
+    }
+  }
+
+  typedef posix-path {
+    type string {
+      pattern '/.*';
+    }
+  }
+
+  container host {
+    leaf addr4 {
+      type ipv4-address-and-prefix;
+    }
+    leaf addr {
+      type ip-address-and-prefix;
+    }
+    leaf addr-with-default {
+      type ip-address-and-prefix;
+      default "192.0.2.1/24";
+    }
+    leaf-list addrs {
+      type ip-address-and-prefix;
+      ordered-by user;
+    }
+    leaf addr-or-bare-or-name {
+      type union {
+        type ip-address-and-prefix;
+        type inet:ip-address-no-zone;
+        type string {
+          pattern '[a-z]+';
+        }
+      }
+    }
+    leaf workdir {
+      type posix-path;
+    }
+  }
+}

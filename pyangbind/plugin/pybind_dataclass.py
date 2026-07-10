@@ -38,7 +38,7 @@ YANG tree, so the generated code reads like the model: it is immediately
 obvious which data a node contains, and IDEs resolve every attribute
 statically.
 
-Two features, both ON by default, each with a CLI opt-out flag:
+Three features, all ON by default, each with a CLI opt-out flag:
 
 Validation (disable with ``--no-dataclass-validation``)
     A small (stdlib-only) runtime is embedded in the generated module and
@@ -88,6 +88,42 @@ Defaults (disable with ``--no-dataclass-defaults``)
     is never a problem either way: *every* generated field has a default
     (``None``, the YANG default, or a factory), so the dataclass
     "non-default field follows defaulted field" TypeError cannot occur.
+
+Native IP types (disable with ``--no-dataclass-native-ip-types``)
+    Leaves whose typedef chain passes through one of the RFC 6991
+    ietf-inet-types address/prefix typedefs (``ip-address``,
+    ``ipv4-address``, ``ipv6-address``, their ``-no-zone`` variants,
+    ``ip-prefix``, ``ipv4-prefix``, ``ipv6-prefix``) are typed as the
+    stdlib ``ipaddress`` classes (``IPv4Address`` / ``IPv6Address`` /
+    ``IPv4Network`` / ``IPv6Network``, the ``ip-*`` unions as ``T4 |
+    T6``) instead of pattern-checked strings. Validation checks the
+    class instead of the patterns (for the IPv6 ``-no-zone`` variants
+    also the absence of a ``scope_id``), YANG defaults construct the
+    object, and serde encodes via ``str()`` and decodes via
+    ``ipaddress.ip_address()`` / ``ip_network(..., strict=False)``. A
+    union mixing native members with other types decodes by trying the
+    native parses and keeping the first candidate the union check
+    accepts, falling back to the plain string for the other members.
+    Caveat: RFC 6991 permits a zone index on IPv4 addresses too, which
+    ``ipaddress.IPv4Address`` cannot represent (IPv6 zones map onto
+    ``IPv6Address.scope_id``) -- zoned IPv4 values are inexpressible
+    with native types; disable the flag if you need them.
+
+    The mapping is extensible to schema-defined typedefs with the
+    repeatable ``--dataclass-native-type [MODULE:]TYPEDEF=CLASS[,...]``
+    option -- a generator-only concern, never YANG metadata: the schema
+    defines an ordinary (typically pattern-restricted string) typedef
+    and the *generator invocation* names the Python class(es) its
+    canonical string form round-trips through (constructor accepts the
+    string, ``str()`` produces it back). E.g.
+    ``--dataclass-native-type my-types:ip-address-and-prefix=ipaddress.IPv4Interface,ipaddress.IPv6Interface``
+    for an ADDR/PREFIXLEN typedef -- the one interface-address shape
+    RFC 6991 has no typedef for. The generated field is annotated with
+    those classes (several = union), validated by isinstance, defaults
+    construct the class, and serde encodes ``str()`` / decodes by
+    trying each constructor. A mapping takes precedence over the
+    built-in ietf-inet-types table and is honored regardless of
+    ``--no-dataclass-native-ip-types`` (it was requested explicitly).
 
 Whenever any feature needs it (currently: validation), every generated
 class additionally carries schema metadata in ClassVars -- invisible to
@@ -174,6 +210,7 @@ The pre-validation/pre-defaults variant of this backend is preserved
 verbatim as ``pybind-dataclass-dumb``.
 """
 
+import importlib
 import keyword
 import optparse
 import os.path
@@ -236,6 +273,59 @@ _INT_BUILTIN_RANGE = {
     "uint64": (0, 2**64 - 1),
 }
 
+# RFC 6991 ietf-inet-types address/prefix typedefs mapped onto the stdlib
+# `ipaddress` module (skipped with --no-dataclass-native-ip-types), as
+# (annotation, _Check base tags, IETF-JSON encode tag): several check tags
+# form a union of alternatives. IPv6 zone indexes ride on
+# IPv6Address.scope_id (absent on the -no-zone variants); IPv4 zone
+# indexes, which RFC 6991 also permits, have no stdlib representation --
+# see the module docstring.
+_INET_NATIVE_TYPES = {
+    "ip-address": (
+        "ipaddress.IPv4Address | ipaddress.IPv6Address",
+        ("ipv4-address", "ipv6-address"),
+        "ip-address",
+    ),
+    "ipv4-address": ("ipaddress.IPv4Address", ("ipv4-address",), "ip-address"),
+    "ipv6-address": ("ipaddress.IPv6Address", ("ipv6-address",), "ip-address"),
+    "ip-address-no-zone": (
+        "ipaddress.IPv4Address | ipaddress.IPv6Address",
+        ("ipv4-address", "ipv6-address-no-zone"),
+        "ip-address",
+    ),
+    "ipv4-address-no-zone": ("ipaddress.IPv4Address", ("ipv4-address",), "ip-address"),
+    "ipv6-address-no-zone": (
+        "ipaddress.IPv6Address",
+        ("ipv6-address-no-zone",),
+        "ip-address",
+    ),
+    "ip-prefix": (
+        "ipaddress.IPv4Network | ipaddress.IPv6Network",
+        ("ipv4-prefix", "ipv6-prefix"),
+        "ip-prefix",
+    ),
+    "ipv4-prefix": ("ipaddress.IPv4Network", ("ipv4-prefix",), "ip-prefix"),
+    "ipv6-prefix": ("ipaddress.IPv6Network", ("ipv6-prefix",), "ip-prefix"),
+}
+
+
+def _parse_native_type_hints(specs):
+    """--dataclass-native-type values -> {(module-or-None, typedef):
+    (class paths,)}. Each spec is [MODULE:]TYPEDEF=CLASS[,CLASS...];
+    without MODULE the typedef name matches in any module."""
+    hints = {}
+    for spec in specs or ():
+        name, sep, classes = spec.partition("=")
+        paths = tuple(c.strip() for c in classes.split(",") if c.strip())
+        if not sep or not paths:
+            raise ValueError(
+                "--dataclass-native-type expects [MODULE:]TYPEDEF=CLASS[,CLASS...],"
+                " got %r" % spec
+            )
+        module, _, typedef = name.strip().rpartition(":")
+        hints[(module or None, typedef)] = paths
+    return hints
+
 _DATA_KEYWORDS = ("container", "list", "leaf", "leaf-list", "choice")
 
 # XPath functions the embedded evaluator implements. must/when expressions
@@ -285,6 +375,7 @@ class _FieldMeta:
     unique: tuple = ()  # list `unique` groups, tuples of field names
     leafref: str | None = None  # absolute schema path of the leafref target
     case: tuple | None = None  # (choice, case) of choice-flattened fields
+    natives: tuple = ()  # native Python classes (native-type hints), for serde
     # XPath constraints, evaluated by validate_tree where the node exists:
     musts: tuple = ()  # ((expression, error-message | None), ...)
     whens: tuple = ()  # ((expression, context-is-self), ...); False = parent
@@ -978,6 +1069,7 @@ class _Check:
     bits: tuple = ()  # allowed bit names; () = unrestricted
     members: tuple = ()  # union member checks; at least one must pass
     fraction_digits: int = 0  # decimal64 precision; 0 = not a decimal64
+    natives: tuple = ()  # allowed classes when base == "native"
 
     def validate(self, value, path):
         if self.base == "union":
@@ -1032,6 +1124,23 @@ class _Check:
             ok = isinstance(value, (int, float, decimal.Decimal)) and not isinstance(value, bool)
         elif base == "bytes":
             ok = isinstance(value, (bytes, bytearray))
+        elif base == "ipv4-address":
+            ok = isinstance(value, ipaddress.IPv4Address)
+        elif base == "ipv6-address":
+            ok = isinstance(value, ipaddress.IPv6Address)
+        elif base == "ipv6-address-no-zone":
+            ok = isinstance(value, ipaddress.IPv6Address) and value.scope_id is None
+        elif base == "ipv4-prefix":
+            ok = isinstance(value, ipaddress.IPv4Network)
+        elif base == "ipv6-prefix":
+            ok = isinstance(value, ipaddress.IPv6Network)
+        elif base == "native":
+            if not isinstance(value, self.natives):
+                raise YangValidationError(
+                    "%s: expected an instance of %s, got %r"
+                    % (path, " | ".join(c.__name__ for c in self.natives), value)
+                )
+            ok = True
         elif base == "bits":
             if isinstance(value, _YangNode):
                 # A generated bits dataclass (e.g. a bits member of a union);
@@ -1313,6 +1422,14 @@ def validate_tree(*roots):
 # YangValidationError, when generated, is a subclass) so callers can catch
 # uniformly whether or not validation is generated.
 _SERDE_RUNTIME = '''
+_NATIVE_IP_TYPES = (
+    ipaddress.IPv4Address,
+    ipaddress.IPv6Address,
+    ipaddress.IPv4Network,
+    ipaddress.IPv6Network,
+)
+
+
 def _encode_value(meta, value):
     if meta.cls is not None and isinstance(value, meta.cls):
         # a bits dataclass -> RFC 7951 space-separated set-bit names
@@ -1330,8 +1447,14 @@ def _encode_value(meta, value):
         return meta.identity_map.get(value, value)
     if meta.encode == "bits" and isinstance(value, (set, frozenset)):
         return " ".join(sorted(value))
+    if meta.encode in ("ip-address", "ip-prefix", "native"):
+        return str(value)
+    if meta.natives and isinstance(value, meta.natives):
+        return str(value)  # a native-hinted member of a union
     if isinstance(value, decimal.Decimal):
         return str(value)
+    if isinstance(value, _NATIVE_IP_TYPES):
+        return str(value)  # a native member of a union carries no encode tag
     return value
 
 
@@ -1344,6 +1467,8 @@ def _encode_annotation_value(adef, value):
         return str(value)
     if adef.encode == "binary" and isinstance(value, (bytes, bytearray)):
         return base64.b64encode(bytes(value)).decode("ascii")
+    if adef.encode in ("ip-address", "ip-prefix"):
+        return str(value)
     if isinstance(value, decimal.Decimal):
         return str(value)
     return value
@@ -1445,6 +1570,41 @@ def _decode_value(meta, value):
         return True  # [null] -> presence
     if meta.encode == "binary" and isinstance(value, str):
         return base64.b64decode(value)
+    if meta.encode == "ip-address" and isinstance(value, str):
+        return ipaddress.ip_address(value)
+    if meta.encode == "ip-prefix" and isinstance(value, str):
+        return ipaddress.ip_network(value, strict=False)
+    if meta.encode == "native" and isinstance(value, str):
+        for cls in meta.natives:
+            try:
+                return cls(value)
+            except (ValueError, TypeError):
+                continue
+        return value
+    if meta.encode == "ip-union" and isinstance(value, str):
+        # a union mixing native (ipaddress / native-type-hinted) members
+        # with other types: try the native parses, keep the first
+        # candidate the union check accepts, and otherwise leave the
+        # string for the other members. Bare-address parse goes first so
+        # an address-only string never gains a /32; hint constructors
+        # before ip_network so ADDR/PREFIXLEN keeps its host bits.
+        for parse in (
+            ipaddress.ip_address,
+            *meta.natives,
+            lambda v: ipaddress.ip_network(v, strict=False),
+        ):
+            try:
+                candidate = parse(value)
+            except (ValueError, TypeError):
+                continue
+            if meta.check is None:
+                return candidate
+            try:
+                meta.check.validate(candidate, "")
+                return candidate
+            except ValueError:
+                continue
+        return value
     if meta.encode == "identityref" and isinstance(value, str) and meta.identity_map:
         # Normalise every accepted spelling (bare, prefixed, or RFC 7951
         # module-qualified) to the preferred one -- bare unless the bare
@@ -1478,6 +1638,10 @@ def _decode_annotation_value(adef, value):
         return decimal.Decimal(str(value))
     if adef.encode == "binary" and isinstance(value, str):
         return base64.b64decode(value)
+    if adef.encode == "ip-address" and isinstance(value, str):
+        return ipaddress.ip_address(value)
+    if adef.encode == "ip-prefix" and isinstance(value, str):
+        return ipaddress.ip_network(value, strict=False)
     return value
 
 
@@ -1680,6 +1844,32 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             "(annotation support is generated by default)",
         )
         group.add_option(
+            "--no-dataclass-native-ip-types",
+            dest="no_dataclass_native_ip_types",
+            action="store_true",
+            default=False,
+            help="Type ietf-inet-types (RFC 6991) address/prefix leaves "
+            "as pattern-checked strings instead of the stdlib ipaddress "
+            "classes (IPv4Address/IPv6Address/IPv4Network/IPv6Network). "
+            "Native types are the default; note they cannot represent an "
+            "IPv4 zone index (IPv6 zones map onto IPv6Address.scope_id)",
+        )
+        group.add_option(
+            "--dataclass-native-type",
+            dest="dataclass_native_types",
+            action="append",
+            default=[],
+            metavar="[MODULE:]TYPEDEF=CLASS[,CLASS...]",
+            help="Map a YANG typedef to native Python class(es) the "
+            "type's canonical string form round-trips through "
+            "(constructor accepts the string, str() produces it back), "
+            "e.g. my-types:ip-and-prefix=ipaddress.IPv4Interface,"
+            "ipaddress.IPv6Interface. Several classes form a union; "
+            "without MODULE: the typedef name matches in any module. "
+            "Repeatable. Takes precedence over the built-in "
+            "ietf-inet-types mapping",
+        )
+        group.add_option(
             "--no-dataclass-defaults",
             dest="no_dataclass_defaults",
             action="store_true",
@@ -1704,6 +1894,10 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             with_xpaths=getattr(ctx.opts, "dataclass_xpaths", False),
             split_dir=getattr(ctx.opts, "dataclass_split_dir", None),
             with_annotations=not getattr(ctx.opts, "no_dataclass_annotations", False),
+            with_native_ip_types=not getattr(
+                ctx.opts, "no_dataclass_native_ip_types", False
+            ),
+            native_type_hints=getattr(ctx.opts, "dataclass_native_types", None),
         )
 
 
@@ -1864,7 +2058,8 @@ class _Emitter:
     def __init__(
         self, ctx, identity_values, with_validation, with_defaults,
         with_origin_comments=False, with_serde=False, with_xpaths=False,
-        identity_canonical=None, with_must_when=True,
+        identity_canonical=None, with_must_when=True, with_native_ip_types=True,
+        native_type_hints=None,
     ):
         self.ctx = ctx
         self.identity_values = identity_values
@@ -1876,6 +2071,11 @@ class _Emitter:
         self.with_origin_comments = with_origin_comments
         self.with_serde = with_serde
         self.with_xpaths = with_xpaths
+        self.with_native_ip_types = with_native_ip_types
+        # (module-or-None, typedef) -> native class paths, from the
+        # --dataclass-native-type options (generator-side input only,
+        # never YANG metadata)
+        self.native_type_hints = _parse_native_type_hints(native_type_hints)
         # The schema metadata table is emitted whenever some feature needs it.
         self.with_meta = with_validation or with_serde or with_xpaths
         # Names of the modules classes are emitted for; leafrefs whose
@@ -1884,6 +2084,10 @@ class _Emitter:
         self.emitted_module_names = set()
         self.lines = []
         self.uses_decimal = False
+        # top-level packages the emitted annotations/metadata reference
+        # ("ipaddress" for the built-in inet mapping, plus whatever
+        # native-type hints name)
+        self.native_imports = set()
         # Module-level reusable types (Literal aliases and bits dataclasses),
         # emitted once between the imports/runtime and the tree classes and
         # referenced by name from every use site.
@@ -1932,6 +2136,70 @@ class _Emitter:
     def _resolve_typedef_chain(self, type_stmt):
         return self._typedef_chain(type_stmt)[-1]
 
+    def _native_inet(self, type_stmt):
+        """The _INET_NATIVE_TYPES entry -- (annotation, check bases,
+        encode tag) -- of a type whose typedef chain passes through one
+        of the ietf-inet-types address/prefix typedefs, or None (always
+        None with --no-dataclass-native-ip-types)."""
+        if not self.with_native_ip_types:
+            return None
+        for level in self._typedef_chain(type_stmt):
+            typedef = getattr(level, "i_typedef", None)
+            if (
+                typedef is not None
+                and typedef.arg in _INET_NATIVE_TYPES
+                and self._module_name(typedef) == "ietf-inet-types"
+            ):
+                self.native_imports.add("ipaddress")
+                return _INET_NATIVE_TYPES[typedef.arg]
+        return None
+
+    def _native_hint(self, type_stmt):
+        """Dotted Python class paths a --dataclass-native-type option
+        mapped onto a typedef in this type's typedef chain, as a tuple,
+        or None. Takes precedence over the built-in ietf-inet-types
+        mapping and is honored regardless of
+        --no-dataclass-native-ip-types (it was requested
+        explicitly)."""
+        if not self.native_type_hints:
+            return None
+        for level in self._typedef_chain(type_stmt):
+            typedef = getattr(level, "i_typedef", None)
+            if typedef is None:
+                continue
+            paths = self.native_type_hints.get(
+                (self._module_name(typedef), typedef.arg)
+            ) or self.native_type_hints.get((None, typedef.arg))
+            if paths:
+                self.native_imports.update(
+                    path.rpartition(".")[0] for path in paths if "." in path
+                )
+                return paths
+        return None
+
+    def _collect_natives(self, type_stmt, node, depth=0):
+        """Every native-type-hinted class reachable from this type
+        (through typedefs and union members), for the serde decode
+        candidates in _FieldMeta.natives."""
+        if depth > 16:
+            return ()
+        hint = self._native_hint(type_stmt)
+        if hint is not None:
+            return hint
+        t = self._resolve_typedef_chain(type_stmt)
+        if t.arg == "union":
+            out = []
+            for member in t.search("type"):
+                for path in self._collect_natives(member, None, depth + 1):
+                    if path not in out:
+                        out.append(path)
+            return tuple(out)
+        if t.arg == "leafref":
+            target = self._leafref_target(node, depth)
+            if target is not None:
+                return self._collect_natives(target.search_one("type"), target, depth + 1)
+        return ()
+
     def annotation(self, type_stmt, node, depth=0):
         """Python annotation string for a YANG `type` statement.
 
@@ -1940,6 +2208,12 @@ class _Emitter:
         """
         if depth > 16:  # defensive: leafref chains can in theory loop
             return "str"
+        hint = self._native_hint(type_stmt)
+        if hint is not None:
+            return " | ".join(hint)
+        native = self._native_inet(type_stmt)
+        if native is not None:
+            return native[0]
         t = self._resolve_typedef_chain(type_stmt)
 
         if t.arg == "bits" and t.search("bit"):
@@ -2168,6 +2442,11 @@ class _Emitter:
         their natural Python/JSON value, or None."""
         if depth > 16:
             return None
+        if self._native_hint(type_stmt) is not None:
+            return "native"
+        native = self._native_inet(type_stmt)
+        if native is not None:
+            return native[2]
         t = self._resolve_typedef_chain(type_stmt)
         if t.arg == "leafref":
             target = self._leafref_target(node, depth)
@@ -2186,7 +2465,25 @@ class _Emitter:
             return "identityref"
         if t.arg == "bits" and t.search("bit"):
             return "bits"
+        if t.arg == "union" and self._union_has_native_member(t, depth):
+            return "ip-union"
         return None
+
+    def _union_has_native_member(self, resolved_union, depth):
+        """Whether a union mixes native (ipaddress or native-type-hinted)
+        members with other types (its values then need the ip-union
+        serde coercion)."""
+        if depth > 16:
+            return False
+        for member in resolved_union.search("type"):
+            if self._native_inet(member) is not None:
+                return True
+            if self._native_hint(member) is not None:
+                return True
+            inner = self._resolve_typedef_chain(member)
+            if inner.arg == "union" and self._union_has_native_member(inner, depth + 1):
+                return True
+        return False
 
     def _identityref_map_name(self, type_stmt, node, depth=0):
         """For an identityref leaf (possibly via typedefs/leafref): the name
@@ -2237,6 +2534,10 @@ class _Emitter:
             encode = self._encode_tag(child.search_one("type"), child)
             if encode is not None:
                 args.append("encode=%r" % encode)
+            if encode in ("native", "ip-union"):
+                natives = self._collect_natives(child.search_one("type"), child)
+                if natives:
+                    args.append("natives=(%s,)" % ", ".join(natives))
             identity_map = self._identityref_map_name(child.search_one("type"), child)
             if identity_map is not None:
                 args.append("identity_map=%s" % identity_map)
@@ -2334,6 +2635,18 @@ class _Emitter:
         accepts anything, so the whole union check collapses to None)."""
         if depth > 16:
             return None
+        hint = self._native_hint(type_stmt)
+        if hint is not None:
+            # the isinstance check replaces the string restrictions
+            return "_Check('native', natives=(%s,))" % ", ".join(hint)
+        native = self._native_inet(type_stmt)
+        if native is not None:
+            # class checks replace the string patterns; string restrictions
+            # written on outer typedef levels do not apply to native objects
+            checks = ["_Check(%r)" % base for base in native[1]]
+            if len(checks) == 1:
+                return checks[0]
+            return "_Check('union', members=(%s,))" % ", ".join(checks)
         chain = self._typedef_chain(type_stmt)
         base = chain[-1]
 
@@ -2437,7 +2750,33 @@ class _Emitter:
         # path in emit_node_class, where the default sets bit fields True)
         return self._default_value_expr(default_stmt.arg, type_stmt), None
 
+    @staticmethod
+    def _native_default_expr(paths, text):
+        """Constructor expression for a native-type-hinted default: probe
+        the alternatives at codegen time (the classes are importable
+        here just as in the generated module's environment) and emit the
+        first that accepts the default string; fall back to the first
+        alternative when none can be probed."""
+        for path in paths:
+            module_name, _, cls_name = path.rpartition(".")
+            if not module_name:
+                continue
+            try:
+                getattr(importlib.import_module(module_name), cls_name)(text)
+            except Exception:
+                continue
+            return "%s(%r)" % (path, text)
+        return "%s(%r)" % (paths[0], text)
+
     def _default_value_expr(self, text, type_stmt):
+        hint = self._native_hint(type_stmt)
+        if hint is not None:
+            return self._native_default_expr(hint, text.strip())
+        native = self._native_inet(type_stmt)
+        if native is not None:
+            if native[2] == "ip-prefix":
+                return "ipaddress.ip_network(%r, strict=False)" % text.strip()
+            return "ipaddress.ip_address(%r)" % text.strip()
         base = self._resolve_typedef_chain(type_stmt)
         if base.arg in _INT_BUILTIN_RANGE:
             return repr(int(text, 0))
@@ -2722,6 +3061,7 @@ def build_dataclasses(
     ctx, modules, fd, with_validation=True, with_defaults=True,
     with_origin_comments=False, with_serde=False, with_xpaths=False,
     split_dir=None, with_must_when=True, with_annotations=True,
+    with_native_ip_types=True, native_type_hints=None,
 ):
     identity_values, identity_canonical = _build_identity_values(ctx)
 
@@ -2729,7 +3069,8 @@ def build_dataclasses(
         ctx, identity_values, with_validation, with_defaults,
         with_origin_comments=with_origin_comments, with_serde=with_serde,
         with_xpaths=with_xpaths, identity_canonical=identity_canonical,
-        with_must_when=with_must_when,
+        with_must_when=with_must_when, with_native_ip_types=with_native_ip_types,
+        native_type_hints=native_type_hints,
     )
     # Reserve the top-level module class names so a reusable type (emitted in
     # the same module namespace) can never shadow one of them.
@@ -2779,6 +3120,12 @@ def build_dataclasses(
         header.append("import re")
     if emitter.uses_decimal or with_validation or with_serde:
         header.append("import decimal")
+    # serde's union fallback isinstance-checks ipaddress types even when
+    # no native leaf was emitted; native-type hints add their own packages
+    packages = set(emitter.native_imports)
+    if with_serde:
+        packages.add("ipaddress")
+    header.extend("import %s" % pkg for pkg in sorted(packages))
     if emitter.with_meta:
         header.append(_META_RUNTIME.rstrip())
     if with_validation:
@@ -2851,6 +3198,8 @@ def _write_split_package(
             header.append("import re")
         if with_validation or with_serde:
             header.append("import decimal")
+        if with_serde or "ipaddress" in emitter.native_imports:
+            header.append("import ipaddress")
         write("_runtime.py", header + runtime_blocks + [""])
 
     # Names generated code may reference from _runtime, private + public.
@@ -2910,6 +3259,11 @@ def _write_split_package(
             header.append("import typing")
         if any("decimal." in line for line in lines):
             header.append("import decimal")
+        header.extend(
+            "import %s" % pkg
+            for pkg in sorted(emitter.native_imports | {"ipaddress"})
+            if any(pkg + "." in line for line in lines)
+        )
         from_runtime = needed(lines, runtime_private)
         if from_runtime:
             header.append("from ._runtime import %s" % ", ".join(from_runtime))
