@@ -162,4 +162,33 @@ CASES = [
                                         "via": "x"}}),
         ],
     ),
+    dict(
+        name="instance-identifier-resolution",
+        yang=M("dt-iir", """
+  list srv { key "name"; leaf name { type string; } leaf v { type uint8; } }
+  container c { leaf on { type boolean; } }
+  leaf strict { type instance-identifier; }
+  leaf loose { type instance-identifier { require-instance false; } }
+"""),
+        docs=[
+            ("existing-list-entry", {
+                "dt-iir:srv": [{"name": "a", "v": 1}],
+                "dt-iir:strict": "/dt-iir:srv[name='a']/v"}),
+            ("absent-instance", {
+                "dt-iir:srv": [{"name": "a", "v": 1}],
+                "dt-iir:strict": "/dt-iir:srv[name='zz']/v"}),
+            ("absent-leaf", {
+                "dt-iir:c": {"on": True},
+                "dt-iir:strict": "/dt-iir:srv[name='a']/v"}),
+            ("schema-invalid-node", {
+                "dt-iir:strict": "/dt-iir:nosuch"}),
+            ("loose-absent-ok", {
+                "dt-iir:loose": "/dt-iir:srv[name='zz']/v"}),
+            ("loose-schema-invalid", {
+                "dt-iir:loose": "/dt-iir:nosuch"}),
+            ("existing-container-leaf", {
+                "dt-iir:c": {"on": True},
+                "dt-iir:strict": "/dt-iir:c/on"}),
+        ],
+    ),
 ]

@@ -1382,6 +1382,72 @@ def _instance_identifier_syntax_ok(text):
     return True
 
 
+def _parse_instance_identifier(text):
+    """Steps of an instance-identifier: a list of (module-or-None, name,
+    predicates) where each predicate is ('.', value) for leaf-list
+    content, (key-name, value) for key predicates, or (None, position)
+    for positional ones. None when the text is not i-i syntax."""
+    if not text.startswith("/"):
+        return None
+    steps = []
+    pos, length = 0, len(text)
+    while pos < length:
+        if text[pos] != "/":
+            return None
+        pos += 1
+        match = _II_NAME_RE.match(text, pos)
+        if match is None:
+            return None
+        qname = match.group(0)
+        pos = match.end()
+        module, _, name = qname.rpartition(":")
+        predicates = []
+        while pos < length and text[pos] == "[":
+            pos += 1
+            body_start = pos
+            quote = None
+            while pos < length:
+                char = text[pos]
+                if quote is not None:
+                    if char == quote:
+                        quote = None
+                elif char == "'" or char == '"':
+                    quote = char
+                elif char == "]":
+                    break
+                pos += 1
+            if pos >= length or text[pos] != "]":
+                return None
+            body = text[body_start:pos].strip()
+            pos += 1
+            if body.isdigit():
+                predicates.append((None, int(body)))
+                continue
+            key_text, eq, value_text = body.partition("=")
+            if not eq:
+                return None
+            key_text = key_text.strip()
+            value_text = value_text.strip()
+            if (
+                len(value_text) >= 2
+                and value_text[0] in ("'", '"')
+                and value_text[-1] == value_text[0]
+            ):
+                value_text = value_text[1:-1]
+            key = "." if key_text == "." else key_text.split(":")[-1]
+            predicates.append((key, value_text))
+        steps.append((module or None, name, predicates))
+    return steps or None
+
+
+def _ii_value_text(value):
+    """YANG canonical text of an instance value for i-i predicate
+    comparison."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Check:
     """Value-level YANG type restrictions for one leaf/leaf-list field."""
@@ -1406,6 +1472,10 @@ class _Check:
     # only the target's syntax; validate_tree defers the required
     # instance check ("(path) = current()") until the tree is complete
     leafref_path: str | None = None
+    # instance-identifier: whether the referenced node must exist
+    # (RFC 7950 9.13.2, default true); schema validity of the path and
+    # instance existence are judged by validate_tree
+    require_instance: bool = True
     bits: tuple = ()  # allowed bit names; () = unrestricted
     members: tuple = ()  # union member checks; at least one must pass
     fraction_digits: int = 0  # decimal64 precision; 0 = not a decimal64
@@ -1589,6 +1659,9 @@ def validate_tree(*roots):
     # union leaves with leafref members: whether the value is valid may
     # depend on instance existence, judged once the tree is complete
     union_ref_uses = []  # (check, leaf _XNode, value, instance path)
+    # instance-identifier leaves: schema validity and (require-instance)
+    # existence of the referenced node, judged once the tree is complete
+    ii_uses = []  # (value, instance path, require_instance)
     doc = _XNode(None, None, None, roots=list(roots))
 
     def union_members_flat(check):
@@ -1808,6 +1881,14 @@ def validate_tree(*roots):
                                 fpath,
                             )
                         )
+                    if (
+                        meta.check is not None
+                        and getattr(meta.check, "base", None)
+                        == "instance-identifier"
+                    ):
+                        ii_uses.append(
+                            (value, fpath, meta.check.require_instance)
+                        )
                     field_set = True
                 if field_set and (meta.musts or meta.whens):
                     queue_constraints(
@@ -1921,6 +2002,115 @@ def validate_tree(*roots):
                 "%s: %r matches no union member (its leafref member has "
                 "no target instance with this value)" % (fpath, value)
             )
+
+    root_modules = set()
+    for root in roots:
+        for meta in getattr(type(root), "_yang_fields", {}).values():
+            root_modules.add(meta.module)
+
+    def resolve_instance_identifier(text, fpath, require_instance):
+        steps = _parse_instance_identifier(text)
+        if steps is None:
+            return  # not i-i syntax: already rejected by the value check
+        if steps[0][0] not in root_modules:
+            return  # outside the validated module set: cannot judge
+        # schema classes and data instances tracked in parallel: schema
+        # validity is required regardless of require-instance (RFC 7950
+        # 9.13), instance existence only when require-instance is true
+        classes = [type(root) for root in roots]
+        objects = list(roots)
+        found_value = False
+        context_module = None
+        for module, name, predicates in steps:
+            module = module or context_module
+            context_module = module
+
+            def field_of(cls):
+                for fname, meta in getattr(cls, "_yang_fields", {}).items():
+                    if meta.yang_name == name and meta.module == module:
+                        return fname, meta
+                return None
+
+            matches = [m for m in (field_of(cls) for cls in classes) if m]
+            if not matches:
+                errors.append(
+                    "%s: instance-identifier %r references %s:%s, which "
+                    "is not a schema node here" % (fpath, text, module, name)
+                )
+                return
+            fname, meta = matches[0]
+            if meta.kind == "list":
+                for key, _want in predicates:
+                    if key is not None and not any(
+                        m.yang_name == key
+                        for m in meta.cls._yang_fields.values()
+                    ):
+                        errors.append(
+                            "%s: instance-identifier %r: %r is not a "
+                            "leaf of list %r" % (fpath, text, key, name)
+                        )
+                        return
+            classes = [meta.cls] if meta.cls is not None else []
+            found_value = False
+            next_objects = []
+            for obj in objects:
+                value = getattr(obj, fname, None)
+                if meta.kind == "container":
+                    if value is not None and _xnode_has_data(value):
+                        next_objects.append(value)
+                elif meta.kind == "list":
+                    entries = list(value or [])
+                    for key, want in predicates:
+                        if key is None:
+                            entries = (
+                                [entries[want - 1]]
+                                if 1 <= want <= len(entries)
+                                else []
+                            )
+                            continue
+                        key_field = next(
+                            f
+                            for f, m in meta.cls._yang_fields.items()
+                            if m.yang_name == key
+                        )
+                        entries = [
+                            e
+                            for e in entries
+                            if getattr(e, key_field, None) is not None
+                            and _ii_value_text(getattr(e, key_field)) == want
+                        ]
+                    next_objects.extend(entries)
+                elif meta.kind == "leaf-list":
+                    elements = list(value or [])
+                    for key, want in predicates:
+                        if key is None:
+                            elements = (
+                                [elements[want - 1]]
+                                if 1 <= want <= len(elements)
+                                else []
+                            )
+                        elif key == ".":
+                            elements = [
+                                e for e in elements if _ii_value_text(e) == want
+                            ]
+                        else:
+                            elements = []
+                    found_value = found_value or bool(elements)
+                else:  # leaf
+                    if value is not None and all(
+                        key == "." and _ii_value_text(value) == want
+                        for key, want in predicates
+                    ):
+                        found_value = True
+            objects = next_objects
+        if require_instance and not objects and not found_value:
+            errors.append(
+                "%s: instance-identifier %r references no existing node"
+                % (fpath, text)
+            )
+
+    for text, fpath, require_instance in ii_uses:
+        resolve_instance_identifier(text, fpath, require_instance)
     for path, target, value in leafref_uses:
         if value not in leaf_values.get(target, ()):
             errors.append(
@@ -3675,6 +3865,12 @@ class _Emitter:
             return None
 
         args = [repr(check_base)]
+        if base.arg == "instance-identifier":
+            for level in chain:
+                require = level.search_one("require-instance")
+                if require is not None and require.arg == "false":
+                    args.append("require_instance=False")
+                    break
         if ranges:
             args.append("ranges=%r" % (tuple(ranges),))
         if lengths:
