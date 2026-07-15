@@ -337,20 +337,35 @@ _DATA_KEYWORDS = ("container", "list", "leaf", "leaf-list", "choice")
 # filtering here keeps the generated tables honest about what is checked).
 _XPATH_SUPPORTED_FUNCTIONS = frozenset(
     {
+        "bit-is-set",
         "boolean",
+        "ceiling",
         "concat",
         "contains",
         "count",
         "current",
+        "deref",
         "derived-from",
         "derived-from-or-self",
+        "enum-value",
         "false",
+        "floor",
+        "last",
+        "local-name",
+        "normalize-space",
         "not",
         "number",
+        "position",
         "re-match",
+        "round",
         "starts-with",
         "string",
         "string-length",
+        "substring",
+        "substring-after",
+        "substring-before",
+        "sum",
+        "translate",
         "true",
     }
 )
@@ -380,6 +395,9 @@ class _FieldMeta:
     # path a tuple of field-name steps (descendant containers + leaf)
     unique: tuple = ()
     leafref: str | None = None  # absolute schema path of the leafref target
+    # prefix-normalized leafref path expression, for the XPath engine's
+    # deref(); present whenever the path is inside the evaluated subset
+    leafref_expr: str | None = None
     # chain of (choice, case) pairs a choice-flattened field came out
     # of, outermost first; None for fields outside any choice
     case: tuple | None = None
@@ -881,7 +899,9 @@ def _xpath_axis(nodes, axis, test):
 
 def _xpath_filter(nodes, predicate, env):
     kept = []
+    size = float(len(nodes))
     for index, node in enumerate(nodes):
+        env = dict(env, position=float(index + 1), size=size)
         result = _xpath_eval(predicate, node, env)
         if isinstance(result, float):
             keep = (index + 1) == result  # positional predicate
@@ -1045,6 +1065,18 @@ def _xsd_fullmatch(text, pattern):
     return compiled.fullmatch(text) is not None
 
 
+def _xpath_round(value):
+    """XPath 1.0 round(): floor(x + 0.5); NaN stays NaN."""
+    if value != value:
+        return value
+    import math
+
+    try:
+        return float(math.floor(value + 0.5))
+    except (OverflowError, ValueError):
+        return value
+
+
 def _xpath_call(name, args, ctx, env):
     if name == "current":
         return [env["current"]]
@@ -1073,6 +1105,114 @@ def _xpath_call(name, args, ctx, env):
         return _xpath_string(values[0]).startswith(_xpath_string(values[1]))
     if name == "re-match":
         return _xsd_fullmatch(_xpath_string(values[0]), _xpath_string(values[1]))
+    if name == "position":
+        if "position" not in env:
+            raise _XPathUnsupported("position() outside a predicate")
+        return env["position"]
+    if name == "last":
+        if "size" not in env:
+            raise _XPathUnsupported("last() outside a predicate")
+        return env["size"]
+    if name == "substring":
+        text = _xpath_string(values[0])
+        start = _xpath_round(_xpath_number(values[1]))
+        if start != start:  # NaN
+            return ""
+        if len(values) > 2:
+            length = _xpath_round(_xpath_number(values[2]))
+            if length != length:
+                return ""
+            end = start + length
+        else:
+            end = float("inf")
+        return "".join(
+            char
+            for position, char in enumerate(text, 1)
+            if start <= position < end
+        )
+    if name == "substring-before":
+        text, sep = _xpath_string(values[0]), _xpath_string(values[1])
+        return text.split(sep, 1)[0] if sep and sep in text else ""
+    if name == "substring-after":
+        text, sep = _xpath_string(values[0]), _xpath_string(values[1])
+        return text.split(sep, 1)[1] if sep and sep in text else ""
+    if name == "translate":
+        text = _xpath_string(values[0])
+        source, target = _xpath_string(values[1]), _xpath_string(values[2])
+        table = {}
+        for index, char in enumerate(source):
+            if char not in table:
+                table[char] = target[index] if index < len(target) else None
+        return "".join(
+            table.get(char, char)
+            for char in text
+            if table.get(char, char) is not None
+        )
+    if name == "normalize-space":
+        text = _xpath_string(values[0]) if values else _xnode_string(ctx)
+        return " ".join(text.split())
+    if name == "floor":
+        import math
+
+        return float(math.floor(_xpath_number(values[0])))
+    if name == "ceiling":
+        import math
+
+        return float(math.ceil(_xpath_number(values[0])))
+    if name == "round":
+        return _xpath_round(_xpath_number(values[0]))
+    if name == "sum":
+        if not isinstance(values[0], list):
+            raise _XPathUnsupported("sum() of a non-node-set")
+        return sum(_xpath_number(_xnode_string(node)) for node in values[0])
+    if name == "local-name":
+        if values:
+            if not isinstance(values[0], list):
+                raise _XPathUnsupported("local-name() of a non-node-set")
+            if not values[0]:
+                return ""
+            node = values[0][0]
+        else:
+            node = ctx
+        return node.meta.yang_name if node.meta is not None else ""
+    if name == "bit-is-set":
+        if not isinstance(values[0], list):
+            raise _XPathUnsupported("bit-is-set() of a non-node-set")
+        if not values[0]:
+            return False
+        bit = _xpath_string(values[1])
+        return bit in _xnode_string(values[0][0]).split()
+    if name == "enum-value":
+        if not isinstance(values[0], list):
+            raise _XPathUnsupported("enum-value() of a non-node-set")
+        for node in values[0][:1]:
+            check = node.meta.check if node.meta is not None else None
+            table = getattr(check, "enum_values", None)
+            if table is None:
+                raise _XPathUnsupported("enum-value() without an enum table")
+            value = table.get(_xnode_string(node))
+            return float("nan") if value is None else float(value)
+        return float("nan")
+    if name == "deref":
+        if not isinstance(values[0], list):
+            raise _XPathUnsupported("deref() of a non-node-set")
+        if not values[0]:
+            return []
+        node = values[0][0]
+        expr = node.meta.leafref_expr if node.meta is not None else None
+        if not expr:
+            raise _XPathUnsupported("deref() of a non-leafref")
+        ast = _xpath_ast_cache.get(expr)
+        if ast is None:
+            ast = _XPathParser(_xpath_tokenize(expr)).parse()
+            _xpath_ast_cache[expr] = ast
+        # RFC 7950 10.3.1: current() inside the leafref path is the
+        # leafref node itself
+        targets = _xpath_eval(ast, node, dict(env, current=node))
+        if not isinstance(targets, list):
+            raise _XPathUnsupported("deref() path yields a non-node-set")
+        wanted = _xnode_string(node)
+        return [t for t in targets if t.is_leaf and _xnode_string(t) == wanted]
     if name == "string-length":
         return float(len(_xpath_string(values[0]) if values else _xnode_string(ctx)))
     if name in ("derived-from", "derived-from-or-self"):
@@ -1259,6 +1399,9 @@ class _Check:
     # identityrefs are CLOSED sets: an empty derived set in the compiled
     # modules means no value is valid (not "unrestricted")
     closed: bool = False
+    # enumeration name -> declared/auto-assigned integer value, for the
+    # XPath engine's enum-value(); None for non-enumerations
+    enum_values: typing.Any = None
     bits: tuple = ()  # allowed bit names; () = unrestricted
     members: tuple = ()  # union member checks; at least one must pass
     fraction_digits: int = 0  # decimal64 precision; 0 = not a decimal64
@@ -2959,6 +3102,18 @@ class _Emitter:
             return None
         return tuple(fields)
 
+    def _leafref_path_expr(self, node):
+        """Prefix-normalized leafref path expression for deref(), or
+        None for non-leafrefs and paths outside the XPath subset."""
+        if getattr(node, "i_leafref_ptr", None) is None:
+            return None
+        path_stmt = None
+        for level in self._typedef_chain(node.search_one("type")):
+            path_stmt = level.search_one("path") or path_stmt
+        if path_stmt is None:
+            return None
+        return self._xpath_source(path_stmt)
+
     def _leafref_pred_must(self, node):
         """Synthesized must expression enforcing an instance-scoped
         leafref: the plain schema-path membership check (meta.leafref)
@@ -3183,6 +3338,10 @@ class _Emitter:
                 # the synthesized instance-scoped must supersedes the
                 # whole-tree schema-path membership check
                 args.append("leafref=%r" % leafref)
+            if self.with_must_when:
+                leafref_expr = self._leafref_path_expr(child)
+                if leafref_expr is not None:
+                    args.append("leafref_expr=%r" % leafref_expr)
         if kind == "leaf":
             mandatory = child.search_one("mandatory")
             if mandatory is not None and mandatory.arg == "true":
@@ -3321,6 +3480,7 @@ class _Emitter:
         values = ()
         bits = ()
         closed = False
+        enum_values = {}
         members = []
         if base.arg == "union":
             for member in base.search("type"):
@@ -3337,6 +3497,15 @@ class _Emitter:
                 return None
             values = tuple(enum_names)
             check_base = "str"
+            # RFC 7950 9.6.4.2 value auto-assignment, for enum-value()
+            next_value = 0
+            for enum_stmt in base.search("enum"):
+                value_stmt = enum_stmt.search_one("value")
+                assigned = (
+                    int(value_stmt.arg) if value_stmt is not None else next_value
+                )
+                enum_values[enum_stmt.arg] = assigned
+                next_value = assigned + 1
         elif base.arg == "identityref":
             # closed set: an empty derived set means NO value is valid
             # (libyang agrees), not "unrestricted"
@@ -3373,6 +3542,8 @@ class _Emitter:
             args.append("values=%r" % (values,))
         if closed:
             args.append("closed=True")
+        if enum_values:
+            args.append("enum_values=%r" % (enum_values,))
         if bits:
             args.append("bits=%r" % (bits,))
         if members:

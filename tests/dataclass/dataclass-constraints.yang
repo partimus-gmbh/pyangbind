@@ -61,9 +61,9 @@ module dataclass-constraints {
       }
       leaf linked {
         type string;
-        // deref() is outside the evaluated subset: filtered out at
-        // codegen, so this must can never fail (or pass) validation.
-        must "deref(.)";
+        // explicit axes are outside the evaluated subset: the must is
+        // skipped at evaluation, never misjudged.
+        must "count(ancestor-or-self::node()) < 0";
       }
     }
     container members {

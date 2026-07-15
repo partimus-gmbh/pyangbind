@@ -1046,11 +1046,11 @@ class DataclassMustWhenTests(unittest.TestCase):
         self.assertIn("re-match", self._violations())
 
     def test_unsupported_expression_is_skipped_not_misjudged(self):
-        # deref() is not implemented; the must on `linked` is filtered
-        # out at codegen, so any value passes
+        # explicit axes are not implemented; the must on `linked`
+        # (always-false if it were evaluated) is skipped, so any value
+        # passes
         self.tree.net.vrf = [self.Vrf(name="a", linked="anything")]
         self.bindings.validate_tree(self.tree)
-        self.assertNotIn("deref", self.bindings._source)
 
     def test_opt_out_flag(self):
         bindings = generate("--no-dataclass-must-when", yang_file=self.yang)

@@ -109,4 +109,57 @@ CASES = [
             ("zone-bad", {"dt-ucat:zone": "%!"}),
         ],
     ),
+    dict(
+        name="xpath-functions-2",
+        yang=M("dt-xf2", """
+  container c {
+    list item { key "k"; leaf k { type string; } leaf v { type uint8; } }
+    leaf closing {
+      type string;
+      must "../item[last()]/v = 9";
+    }
+    leaf head {
+      type string;
+      must "../item[position() = 1]/v = 1";
+    }
+    leaf pre { type string; must "substring-before(., '-') = 'ab'"; }
+    leaf post { type string; must "substring-after(., '-') = 'cd'"; }
+    leaf mid { type string; must "substring(., 2, 2) = 'xy'"; }
+    leaf tr { type string; must "translate(., 'abc', 'xyz') = 'xyz'"; }
+    leaf ns { type string; must "normalize-space(.) = 'a b'"; }
+    leaf fl { type uint8; must "floor(. div 2) = 2"; }
+    leaf ce { type uint8; must "ceiling(. div 2) = 3"; }
+    leaf ro { type uint8; must "round(. div 4) = 1"; }
+    leaf total { type uint8; must ". = sum(../item/v)"; }
+    leaf flags { type bits { bit b1; bit b2; } }
+    leaf need-b1 { type string; must "bit-is-set(../flags, 'b1')"; }
+    leaf color { type enumeration { enum red { value 5; } enum blue; } }
+    leaf ev { type string; must "enum-value(../color) = 6"; }
+    leaf pick { type leafref { path "../item/k"; } }
+    leaf via { type string; must "deref(../pick)/../v = 7"; }
+  }
+"""),
+        docs=[
+            ("positional-ok", {"dt-xf2:c": {"item": [{"k": "a", "v": 1}, {"k": "b", "v": 9}],
+                                            "closing": "x", "head": "x"}}),
+            ("positional-bad", {"dt-xf2:c": {"item": [{"k": "a", "v": 1}, {"k": "b", "v": 2}],
+                                             "closing": "x"}}),
+            ("strings-ok", {"dt-xf2:c": {"pre": "ab-zz", "post": "zz-cd", "mid": "zxyz",
+                                         "tr": "abc", "ns": "  a   b  "}}),
+            ("strings-bad", {"dt-xf2:c": {"pre": "zz-ab"}}),
+            ("math-ok", {"dt-xf2:c": {"fl": 5, "ce": 5, "ro": 5}}),
+            ("math-bad", {"dt-xf2:c": {"fl": 7}}),
+            ("sum-ok", {"dt-xf2:c": {"item": [{"k": "a", "v": 1}, {"k": "b", "v": 9}],
+                                     "total": 10}}),
+            ("sum-bad", {"dt-xf2:c": {"item": [{"k": "a", "v": 1}], "total": 3}}),
+            ("bits-ok", {"dt-xf2:c": {"flags": "b1 b2", "need-b1": "x"}}),
+            ("bits-bad", {"dt-xf2:c": {"flags": "b2", "need-b1": "x"}}),
+            ("enum-ok", {"dt-xf2:c": {"color": "blue", "ev": "x"}}),
+            ("enum-bad", {"dt-xf2:c": {"color": "red", "ev": "x"}}),
+            ("deref-ok", {"dt-xf2:c": {"item": [{"k": "a", "v": 7}], "pick": "a",
+                                       "via": "x"}}),
+            ("deref-bad", {"dt-xf2:c": {"item": [{"k": "a", "v": 8}], "pick": "a",
+                                        "via": "x"}}),
+        ],
+    ),
 ]
