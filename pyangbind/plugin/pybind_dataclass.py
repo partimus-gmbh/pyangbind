@@ -427,6 +427,11 @@ class _AnnotationDef:
 # case annotate() rejects every annotation name.
 _YANG_ANNOTATIONS: dict = {}
 
+# canonical `module-name:identity` -> tuple of DIRECT base canonicals.
+# Populated by generated code; the XPath engine climbs it to evaluate
+# derived-from() / derived-from-or-self() transitively.
+_YANG_IDENTITY_BASES: dict = {}
+
 
 def annotate(node, member=None, index=None, /, **values):
     """Attach RFC 7952 metadata annotations to a data node instance.
@@ -1006,16 +1011,40 @@ def _xpath_call(name, args, ctx, env):
         nodes = values[0]
         if not isinstance(nodes, list):
             raise _XPathUnsupported("%s() of a non-node-set" % name)
-        if not nodes:
-            return False
-        identity = _xpath_string(values[1]).split(":")[-1]
-        if name == "derived-from-or-self" and any(
-            _xnode_string(node).split(":")[-1] == identity for node in nodes
-        ):
-            return True
-        # actual derivation would need the identity hierarchy, which the
-        # bindings do not carry -- err on the side of not failing
-        raise _XPathUnsupported("%s() beyond an exact identity match" % name)
+        target = _xpath_string(values[1])
+
+        def target_matches(canonical):
+            # prefixes were normalized to module names at codegen; a
+            # bare target matches on the local name
+            if ":" in target:
+                return canonical == target
+            return canonical.split(":", 1)[-1] == target
+
+        for node in nodes:
+            value = _xnode_string(node)
+            id_map = node.meta.identity_map if node.meta is not None else None
+            canonical = id_map.get(value) if id_map else None
+            if canonical is None:
+                # value outside the known hierarchy: keep the exact
+                # or-self shortcut, otherwise skip rather than misjudge
+                if name == "derived-from-or-self" and value.split(":")[-1] == target.split(":")[-1]:
+                    return True
+                raise _XPathUnsupported(
+                    "%s() on a value outside the identity table" % name
+                )
+            if name == "derived-from-or-self" and target_matches(canonical):
+                return True
+            seen = set()
+            stack = list(_YANG_IDENTITY_BASES.get(canonical, ()))
+            while stack:
+                base = stack.pop()
+                if base in seen:
+                    continue
+                seen.add(base)
+                if target_matches(base):
+                    return True
+                stack.extend(_YANG_IDENTITY_BASES.get(base, ()))
+        return False
     raise _XPathUnsupported("function %s()" % name)
 
 
@@ -2304,7 +2333,23 @@ def _build_identity_values(ctx):
             stack.extend(direct_derived.get(id(ident), []))
         values[base_id] = sorted(out)
         canonical[base_id] = canon
-    return values, canonical
+
+    # canonical identity -> tuple of DIRECT base canonicals, for the
+    # XPath engine's transitive derived-from(-or-self)
+    bases = {}
+    for ident in identities.values():
+        parents = []
+        for base in ident.search("base"):
+            target = getattr(base, "i_identity", None)
+            if target is not None:
+                parents.append(
+                    "%s:%s" % (_Emitter._module_name(target), target.arg)
+                )
+        if parents:
+            bases["%s:%s" % (_Emitter._module_name(ident), ident.arg)] = tuple(
+                sorted(parents)
+            )
+    return values, canonical, bases
 
 
 def _parse_bound(text):
@@ -3548,7 +3593,7 @@ def build_dataclasses(
     split_dir=None, with_must_when=True, with_annotations=True,
     with_native_ip_types=True, native_type_hints=None,
 ):
-    identity_values, identity_canonical = _build_identity_values(ctx)
+    identity_values, identity_canonical, identity_bases = _build_identity_values(ctx)
 
     emitter = _Emitter(
         ctx, identity_values, with_validation, with_defaults,
@@ -3566,6 +3611,14 @@ def build_dataclasses(
         annotation_stmts = _collect_annotation_stmts(ctx)
         if annotation_stmts:
             emitter.emit_annotation_registry(annotation_stmts)
+    if emitter.with_meta and with_must_when and identity_bases:
+        emitter.lines.append("_YANG_IDENTITY_BASES.update({")
+        for canonical in sorted(identity_bases):
+            emitter.lines.append(
+                "    %r: %r," % (canonical, identity_bases[canonical])
+            )
+        emitter.lines.append("})")
+        emitter.lines.append("")
     segments = []  # (module, its slice of emitter.lines), for split mode
     for module in data_modules:
         start = len(emitter.lines)

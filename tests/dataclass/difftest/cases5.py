@@ -25,4 +25,47 @@ CASES = [
                 {"name": "b2", "srv": [{"sn": "own"}], "picks": ["own", "only-b1"]}]}),
         ],
     ),
+    dict(
+        name="unique-descendant",
+        yang=M("dt-uniqd", """
+  list l {
+    key "k";
+    unique "c/v name";
+    leaf k { type string; }
+    leaf name { type string; }
+    container c { leaf v { type uint8; } }
+  }
+"""),
+        docs=[
+            ("dup-pair", {"dt-uniqd:l": [
+                {"k": "a", "name": "n", "c": {"v": 1}},
+                {"k": "b", "name": "n", "c": {"v": 1}}]}),
+            ("distinct-descendant", {"dt-uniqd:l": [
+                {"k": "a", "name": "n", "c": {"v": 1}},
+                {"k": "b", "name": "n", "c": {"v": 2}}]}),
+            ("absent-leaf-skips", {"dt-uniqd:l": [
+                {"k": "a", "name": "n"},
+                {"k": "b", "name": "n", "c": {"v": 1}}]}),
+        ],
+    ),
+    dict(
+        name="derived-from-transitive",
+        yang=M("dt-dft", """
+  identity base;
+  identity mid { base base; }
+  identity deep { base mid; }
+  identity other { base base; }
+  leaf kind { type identityref { base base; } }
+  leaf need-mid { type string; must "derived-from(../kind, 'mid')"; }
+  leaf need-mid-self { type string; must "derived-from-or-self(../kind, 'mid')"; }
+"""),
+        docs=[
+            ("transitive-true", {"dt-dft:kind": "deep", "dt-dft:need-mid": "x"}),
+            ("self-not-derived", {"dt-dft:kind": "mid", "dt-dft:need-mid": "x"}),
+            ("unrelated", {"dt-dft:kind": "other", "dt-dft:need-mid": "x"}),
+            ("or-self-true", {"dt-dft:kind": "mid", "dt-dft:need-mid-self": "x"}),
+            ("or-self-transitive", {"dt-dft:kind": "deep", "dt-dft:need-mid-self": "x"}),
+            ("or-self-unrelated", {"dt-dft:kind": "other", "dt-dft:need-mid-self": "x"}),
+        ],
+    ),
 ]
