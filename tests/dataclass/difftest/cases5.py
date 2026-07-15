@@ -213,4 +213,23 @@ CASES = [
             ("present-empty-mandatory-violated", {"dt-pep:strictbox": {}}),
         ],
     ),
+    dict(
+        name="anydata-anyxml",
+        yang=M("dt-any", """
+  container c {
+    anydata blob;
+    anyxml frag;
+    leaf tag { type string; }
+  }
+  anydata top-blob { mandatory true; }
+"""),
+        docs=[
+            ("anydata-object", {"dt-any:c": {"blob": {"x": [1, 2], "y": "z"},
+                                             "tag": "t"},
+                                "dt-any:top-blob": {"a": 1}}),
+            ("anyxml-value", {"dt-any:c": {"frag": ["a", {"b": True}]},
+                              "dt-any:top-blob": {"a": 1}}),
+            ("mandatory-anydata-missing", {"dt-any:c": {"tag": "t"}}),
+        ],
+    ),
 ]

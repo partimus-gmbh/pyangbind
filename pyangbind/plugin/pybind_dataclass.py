@@ -329,7 +329,15 @@ def _parse_native_type_hints(specs):
         hints[(module or None, typedef)] = paths
     return hints
 
-_DATA_KEYWORDS = ("container", "list", "leaf", "leaf-list", "choice")
+_DATA_KEYWORDS = (
+    "container",
+    "list",
+    "leaf",
+    "leaf-list",
+    "choice",
+    "anydata",
+    "anyxml",
+)
 
 # XPath functions the embedded evaluator implements. must/when expressions
 # calling anything else are not emitted into the metadata at all (the
@@ -621,6 +629,8 @@ def _xnode_children(xnode):
             elif meta.kind == "leaf-list":
                 for element in value or []:
                     yield _XNode(None, meta, xnode, value=element, is_leaf=True)
+            elif meta.kind in ("anydata", "anyxml"):
+                continue  # opaque to XPath
             elif meta.cls is not None and isinstance(value, meta.cls):
                 if value:
                     yield _XNode(None, meta, xnode, value=value, is_leaf=True)
@@ -1929,7 +1939,11 @@ def validate_tree(*roots):
                         _XNode(None, meta, xself, value=value, is_leaf=True),
                         fpath,
                     )
-                if meta.kind == "leaf" and meta.mandatory and value is None:
+                if (
+                    meta.kind in ("leaf", "anydata", "anyxml")
+                    and meta.mandatory
+                    and value is None
+                ):
                     pending.append(
                         (meta.case, "error", "%s: mandatory leaf is not set" % fpath)
                     )
@@ -2282,6 +2296,9 @@ def to_ietf_json(root):
             elif meta.kind == "leaf-list":
                 if value:
                     out[key] = [_encode_value(meta, element) for element in value]
+            elif meta.kind in ("anydata", "anyxml"):
+                if value is not None:
+                    out[key] = value  # opaque, emitted verbatim
             elif meta.kind == "leaf":
                 if meta.cls is not None and isinstance(value, meta.cls):
                     if value:  # bits: present iff any bit is set
@@ -3700,7 +3717,7 @@ class _Emitter:
                 leafref_expr = self._leafref_path_expr(child)
                 if leafref_expr is not None:
                     args.append("leafref_expr=%r" % leafref_expr)
-        if kind == "leaf":
+        if kind in ("leaf", "anydata", "anyxml"):
             mandatory = child.search_one("mandatory")
             if mandatory is not None and mandatory.arg == "true":
                 args.append("mandatory=True")
@@ -4208,6 +4225,13 @@ class _Emitter:
                 self.lines.append("")
                 field_metas.append(
                     (fname, self.field_meta_expr(child, case, child_cname, when_stmts))
+                )
+            elif child.keyword in ("anydata", "anyxml"):
+                # opaque: any RFC 7951 JSON value, held and re-emitted
+                # verbatim, never validated
+                self.lines.append("%s%s: typing.Any = None" % (body_indent, fname))
+                field_metas.append(
+                    (fname, self.field_meta_expr(child, case, when_stmts=when_stmts))
                 )
             else:  # leaf / leaf-list
                 resolved = self._resolve_typedef_chain(child.search_one("type"))
